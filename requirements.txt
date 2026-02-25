@@ -1,0 +1,22 @@
+# 개원포화도 프로젝트 Python 패키지
+
+# 환경변수
+python-dotenv>=1.0.0
+
+# 데이터 수집
+requests>=2.31.0
+
+# 데이터 처리
+pandas>=2.0.0
+
+# 대시보드 UI
+streamlit>=1.35.0
+
+# 지도 시각화
+folium>=0.16.0
+streamlit-folium>=0.20.0
+geopandas>=1.0.0
+shapely>=2.0.0
+
+# 차트
+plotly>=5.20.0
