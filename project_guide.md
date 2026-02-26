@@ -138,6 +138,23 @@
   - **Supabase(온라인 DB) 통합 준비**: 언제든 퍼블릭 클라우드 DB로 이관할 수 있도록 `scripts/migrate_to_supabase.py` 스크립트 작성 및 `DB_data/supabase_schema.md` DDL 구축.
   - **정기 업데이트 스크립트 도입**: 로컬 및 원격 DB의 데이터를 스케줄러를 통해 최신 공공데이터와 동기화할 수 있도록 `scripts/update_db_from_api.py` 파일 생성.
 
+- [x] **21단계 (완료):** 아파트 실거래가(소득 대리 지표) 파이프라인 구축 및 UI 연동
+  - **데이터 수집**: 국토교통부 실거래가 Excel 14개월치(2025.01~2026.02, 607,586건)를 `DB_data/아파트 실거래가/` 폴더에 적재.
+  - **`scripts/import_apt_price.py` 신규 작성**:
+    - Excel skiprows=12 구조 파싱, 거래금액(쉼표 포함 문자열) 정제, 평당가 계산 (`거래금액(만원) × 3.3058 / 전용면적(㎡)`).
+    - `시군구` 컬럼 토큰 파싱(2~5토큰 대응): `parts[0]`=시도, `parts[-1]`=법정동명, 중간 읍면 토큰 제거 로직.
+    - 3단계 Fallback join: ① (시도+시군구+법정동) → ② (시도+시군구 마지막 단어+법정동) → ③ (시도+법정동) 순 매핑, **매핑 성공률 100%** 달성.
+    - **3,452개 법정동** 집계 결과를 `apt_price_bjd` 테이블로 저장 (avg/med 평당가, 거래건수, 기간).
+  - **`modules/data_merge.py` — `enrich_with_apt_price()` 함수 신규 추가**:
+    - `hjd_cd → bjd_cd → apt_price_bjd` 거래량 가중 평균 조인 (SQL 단계에서 처리).
+    - dong/sido/national 레벨별 match_key 길이(10/5/2자리)에 따라 집계 자동 분기.
+    - `apt_price_bjd` 테이블 미존재 시 graceful fallback — 원본 DataFrame 그대로 반환.
+    - `DataMerger.run()` 결과 산출 직후 자동 호출로 모든 과목 결과에 `avg_price_per_pyeong` 컬럼 추가.
+  - **`app.py` UI 연동**:
+    - `_make_scatter_chart()` 신규: 아파트 평당가(X) × 포화도 지수(Y) 산점도. 중위 평당가/SI=1.0 기준선, 사분면 레이블(최적 입지·기회 지역·주의·불리) 오버레이. 지도+막대 섹션 하단에 자동 표시.
+    - 지도 hover tooltip에 아파트 평당가 항목 조건부 추가.
+    - 행정동 클릭 요약 지표: 5개 → 6개 (아파트 평당가 추가).
+
 - [x] **20단계 (완료):** sido 분석 match_key 버그 수정 — 구(區) 분할 시·부천시 코드 불일치 해결
   - **[버그] 구분할 시의 시군구 분리 표시**: `get_sgg_list`가 시(市) 레벨과 하위 구(區) 레벨 항목을 함께 반환해, 수원시가 4개 구로 쪼개지는 등 같은 시가 별도 폴리곤으로 표시되는 문제 발견.
     - 전국 56개 코드 영향: 수원시(4구)·성남시(3구)·안양시(2구)·부천시(3구)·고양시(3구)·용인시(3구)·천안시(2구)·청주시(4구)·창원시(5구) 등.
@@ -165,6 +182,7 @@
 │   └── data_merge.py            # 데이터 병합, 코드 표준화 및 지수 산출
 ├── scripts/                     # DB 마이그레이션 및 관리 스크립트 모음
 │   ├── create_local_db.py       # 원본 엑셀 파일을 SQLite DB로 파싱 생성
+│   ├── import_apt_price.py      # 아파트 실거래가 Excel → apt_price_bjd 테이블 적재
 │   ├── migrate_to_supabase.py   # 구축된 로컬 DB를 Supabase로 Bulk Insert
 │   └── update_db_from_api.py    # 공공 API 주기적 호출로 DB 최신화 (배치용)
 ├── data/
@@ -172,6 +190,9 @@
 │   └── geojson/
 │       ├── national_dong.geojson  # 전국 행정동 경계 (원본)
 │       └── seoul_dong.geojson     # 서울 전용 (백업용)
+├── DB_data/
+│   ├── 아파트 실거래가/           # 국토부 실거래가 Excel (아파트(매매)_실거래가_YYYYMM.xlsx)
+│   └── ...                      # 기타 인구/병원 원본 엑셀
 └── GUIDE/                       # API 가이드 문서 및 인증키 정보
 ```
 
@@ -280,10 +301,88 @@
 | **Step 2** | **지도 폴리곤 최신화** | 2024~2025년 사이 신설되거나 통폐합된 행정동(예: 상일1동, 개포3동 등)의 최신 공간 데이터(GeoJSON)를 교체하여 지도상에 나타나지 않는 블랭크 지역 완벽 해소. | 중간 |
 | **Step 3** | **온라인 DB (Supabase) 배포** | Streamlit 웹앱을 타인에게 배포하거나 호스팅(Streamlit Cloud 등) 환경으로 전환할 시기 도래 시 적용. `migrate_to_supabase.py`는 이미 완성됨. 단, 웹앱 코드(`population_api.py`, `hospital_api.py`)의 DB 연결부를 SQLite → Supabase 클라이언트로 교체해야 함. 변경 파일 목록은 아래 참조. | 선택 |
 | **Step 4** | **AI 입지 분석 리포트 도입** | Gemini API 등 LLM을 연동. 사용자가 분석 실행 시 "포화도는 1.5로 여유로우며, 배후 11만 세대 대비 내과 개원이 매우 유리합니다" 와 같은 텍스트 기반 인사이트 요약 패널 추가. | 장기 |
+| ~~**Step 5**~~ | ~~**아파트 실거래가(소득 지표) 통합**~~ | ✅ **완료 (21단계)** — `scripts/import_apt_price.py` + `enrich_with_apt_price()` + `_make_scatter_chart()` 구현. 14개월치(607,586건) 파싱, 3,452개 법정동 평당가 저장, 소득×포화도 산점도 UI 연동. | 완료 |
 
 ---
 
-### 10. 온라인 DB 이관 계획 (Supabase)
+### 10. 아파트 실거래가(소득 대리 지표) 데이터 파이프라인 ✅ 구현 완료
+
+> **행정동 단위 소득 실데이터 부재에 따른 대안 구축 방안 — 21단계에서 구현 완료**
+
+- **배경**: 전국의 행정동 단위 평균 소득 데이터는 무료 공공데이터로 전체 공개되지 않음.
+- **해결책**: 국토교통부 아파트 매매 실거래가를 수집하여 **법정동별 아파트 평당 평균 거래가**를 소득 대리 지표로 활용.
+
+#### 데이터 현황
+
+| 항목 | 내용 |
+|------|------|
+| 데이터 기간 | 2025.01 ~ 2026.02 (14개월) |
+| 총 거래 건수 | 607,586건 |
+| 저장 법정동 수 | 3,452개 (`apt_price_bjd` 테이블) |
+| 매핑 성공률 | 100.0% |
+| 행정동 커버리지 | 3,452개 법정동 → 2,663개 행정동 연결 |
+
+#### 파이프라인 구조
+
+```
+[DB_data/아파트 실거래가/*.xlsx]  (아파트(매매)_실거래가_YYYYMM.xlsx)
+      ↓ python scripts/import_apt_price.py
+[전처리]
+ - skiprows=12, header=0 (헤더는 13번째 행)
+ - 거래금액(만원): "120,000" → 쉼표 제거 후 float
+ - 평당가 = 거래금액(만원) × 3.3058 / 전용면적(㎡)
+ - 시군구 컬럼 파싱: parts[0]=시도, parts[-1]=법정동명, 중간 읍면 토큰 제거
+      ↓ 3단계 Fallback join (region_code_mapping)
+ ① (sido_nm, sigungu_nm, bjd_nm) 완전 일치
+ ② (sido_nm, sigungu 마지막 단어, bjd_nm)
+ ③ (sido_nm, bjd_nm) — sigungu 무시 폴백
+      ↓ bjd_cd 획득 (매핑 성공률 100%)
+[법정동별 집계] GROUP BY bjd_cd → 평균/중위 평당가, 거래건수
+      ↓
+[apt_price_bjd 테이블] bjd_cd | avg_price | med_price | trade_count | base_ym_from | base_ym_to
+      ↓ data_merge.py: enrich_with_apt_price()
+[region_code_mapping join] bjd_cd → hjd_cd (거래량 가중 평균 SQL)
+      ↓ match_key 레벨별 집계 (dong=10자리 / sido=5자리 / national=2자리)
+[si_df에 avg_price_per_pyeong 컬럼 추가]
+      ↓ app.py
+[지도 hover / 클릭 지표 6번째 / 소득×포화도 산점도]
+```
+
+#### `apt_price_bjd` 테이블 스키마
+
+| 컬럼 | 타입 | 설명 |
+|------|------|------|
+| `bjd_cd` | TEXT | 법정동 코드 10자리 (INDEX) |
+| `avg_price_per_pyeong` | INTEGER | 평균 평당가 (만원/평) |
+| `med_price_per_pyeong` | INTEGER | 중위수 평당가 (만원/평, 이상치에 강건) |
+| `trade_count` | INTEGER | 거래건수 (신뢰도 지표) |
+| `base_ym_from` | TEXT | 데이터 시작 년월 (예: "202501") |
+| `base_ym_to` | TEXT | 데이터 종료 년월 (예: "202602") |
+
+#### 산점도 읽는 법 (소득 × 포화도 입지 분석)
+
+```
+y축(포화도 ↑) × x축(평당가 ↑)
+
+[기회 지역]     │   [최적 입지 ★]
+ 저소득 · 여유  │   고소득 · 여유
+────────────────┼────────────────  ← SI = 1.0 (전국 평균)
+   [불리]       │     [주의]
+ 저소득 · 포화  │   고소득 · 포화
+                ↑ 중위 평당가
+```
+
+#### 정기 업데이트 방법 (연 1회 권장)
+
+```bash
+# 1. DB_data/아파트 실거래가/ 폴더에 최신 Excel 파일 추가 (국토부 실거래가 공개시스템)
+# 2. 적재 스크립트 실행 (기존 apt_price_bjd 테이블 교체)
+python scripts/import_apt_price.py
+```
+
+---
+
+### 11. 온라인 DB 이관 계획 (Supabase)
 
 > **현재 미진행 — 향후 외부 배포(Streamlit Cloud 등) 시점에 실행**
 
