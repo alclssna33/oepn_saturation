@@ -8,10 +8,16 @@
 
 ---
 
-### 2. 데이터 수집 전략 (Data Acquisition)
+### 2. 데이터 수집 전략 및 DB 아키텍처 개편 (Data Acquisition & Architecture)
 
-프로젝트에 필요한 API 연동 및 데이터 수집을 위해 `GUIDE` 폴더의 문서를 적극 참조합니다.
-* **공공데이터포털 API 인증키:** `GUIDE/공공데이터포탈 API키.txt` 참조 (개인 인증키 활용).
+**[개편 배경]** 
+기존에는 매 요청마다 행안부/심평원 API를 실시간으로 호출하여 데이터를 수집했으나, 응답 지연과 데이터 정확성 등 문제가 발생했습니다.
+이를 해결하기 위해 **데이터베이스(DB) 기반 로컬/온라인 저장소 체계**로 개편합니다.
+*   **현재 진행 상태:** 로컬 파일(`DB_data/` 폴더 내 엑셀/텍스트 데이터)을 기반으로 DB를 구성하고, API는 향후 **DB 주기적 업데이트 용도**로만 사용합니다.
+*   **온라인 DB 마이그레이션:** 로컬에서 구성한 DB를 최종적으로 **Supabase**로 이관하여 안정적인 데이터 서빙 환경을 구축할 계획입니다.
+
+설계를 위해 `GUIDE` 폴더의 문서를 적극 참조합니다.
+* **공공데이터포털 API 인증키:** `GUIDE/공공데이터포탈 API키.txt` 참조 (개인 인증키 활용 - 향후 DB 업데이트 스크립트 용).
 
 #### A. 인구 데이터 (이중 API 구조)
 
@@ -51,10 +57,17 @@
 | 분석 레벨 | match_key 형식 | 예시 |
 |-----------|----------------|------|
 | national | 시도코드 앞 2자리 | `"11"` (서울) |
-| sido | 시도코드+시군구코드 5자리 | `"11110"` (종로구) |
+| sido | **시(市) 레벨** 5자리 (구가 있는 시는 구→시 통합) | `"41110"` (수원시), `"11215"` (서울 광진구) |
 | dong | 전체 행정동코드 10자리 | `"1111051500"` |
 
 특수 코드 변환: `adm_cd2`가 "42"로 시작 → "51"(강원), "45"로 시작 → "52"(전북), "41000..."으로 시작 → "36"(세종)
+
+**sido 레벨 구→시 통합 로직** (`existing_sgg_codes` 체크):
+- `adm[:4]+"0"` (city_5)가 `existing_sgg_codes` 집합에 존재 → 하위 구이므로 city_5 반환
+  - 수원시 장안구 "41111" → city_5 "41110" → "41110" in sgg_codes(수원시) → "41110" ✓
+  - 부천시 오정구 "41192" → city_5 "41190" → "41190" in sgg_codes(부천시) → "41190" ✓
+- city_5가 `existing_sgg_codes`에 없으면 → 독립 구이므로 원래 5자리 유지
+  - 서울 광진구 "11215" → city_5 "11210" → not in sgg_codes → "11215" 유지 ✓
 
 ---
 
@@ -119,6 +132,24 @@
   - **지도·막대그래프 색상 통일**: 기존 지도의 연속 컬러스케일(빨강→주황→연두→초록)을 `saturation_level` 기반 이산 4색으로 교체. 포화=`#DC2626`, 보통=`#D97706`, 여유=`#16A34A`, 데이터없음=`#9CA3AF`. 지도 colorbar에 등급명 레이블 표시.
   - **막대그래프 평균 기준선**: x=1 위치에 점선 세로선 + "평균(1.0)" 레이블 추가. 기준선 좌측=포화, 우측=여유를 직관적으로 파악 가능.
 
+- [x] **19단계 (완료):** 데이터베이스(DB) 기반 아키텍처 개편 및 최적화
+  - **Local SQLite DB 구축**: `DB_data` 폴더의 원본 엑셀(인구수, 병의원, 법정동 맵핑 정보 등 50만여 건)을 파싱하여 정규화된 5개 RDB 테이블(`data/saturation.db`)로 구성 완료.
+  - **Streamlit 성능 혁신**: 기존의 느린 심평원/행안부 HTTP API 호출(`population_api.py`, `hospital_api.py`) 로직을 Pandas `read_sql_query` 기반 SQLite 즉시 조회로 전환. 화면 지도 및 그래프 렌더링 속도 수 십 배 상승.
+  - **Supabase(온라인 DB) 통합 준비**: 언제든 퍼블릭 클라우드 DB로 이관할 수 있도록 `scripts/migrate_to_supabase.py` 스크립트 작성 및 `DB_data/supabase_schema.md` DDL 구축.
+  - **정기 업데이트 스크립트 도입**: 로컬 및 원격 DB의 데이터를 스케줄러를 통해 최신 공공데이터와 동기화할 수 있도록 `scripts/update_db_from_api.py` 파일 생성.
+
+- [x] **20단계 (완료):** sido 분석 match_key 버그 수정 — 구(區) 분할 시·부천시 코드 불일치 해결
+  - **[버그] 구분할 시의 시군구 분리 표시**: `get_sgg_list`가 시(市) 레벨과 하위 구(區) 레벨 항목을 함께 반환해, 수원시가 4개 구로 쪼개지는 등 같은 시가 별도 폴리곤으로 표시되는 문제 발견.
+    - 전국 56개 코드 영향: 수원시(4구)·성남시(3구)·안양시(2구)·부천시(3구)·고양시(3구)·용인시(3구)·천안시(2구)·청주시(4구)·창원시(5구) 등.
+  - **[버그] 부천시 의원 0개**: 구폐지(2016) 후에도 population DB는 구 코드(41192/41194/41196)를 유지하는 반면, GeoJSON은 통합 코드(41190)만 사용 → hospital match_key `41190`이 population match_key `4119x`와 불일치 → 의원 0개 오표시.
+  - **[해결책] `existing_sgg_codes` 체크 로직 도입** (`modules/data_merge.py`):
+    - `get_sgg_list` 결과로 시도 내 전체 sgg 코드 집합(`existing_sgg_codes`) 빌드.
+    - population 루프 및 `_finalize_key` 함수에서 `city_5 = adm[:4]+"0"`이 `existing_sgg_codes`에 존재하면 → 하위 구이므로 parent city 코드로 통합; 없으면 → 독립 구이므로 원래 코드 유지.
+    - 서울 광진구(11215 → city_5 11210 not in sgg_codes → 유지), 수원시 장안구(41111 → city_5 41110 in sgg_codes → 통합) 등 모든 케이스 정확 처리.
+    - `pd.concat` 후 동일 match_key 행을 수치 컬럼 기준 합산하여 구별 인구를 시 단위로 통합.
+  - **[해결책] GeoJSON dissolve_key 동적 계산** (`app.py`):
+    - 기존 단순 `str[:5]` 슬라이싱 → `existing_sgg_codes` 기반 동적 판별로 교체, 구 폴리곤을 parent city 폴리곤으로 정확히 병합.
+
 ---
 
 ### 5. 현재 파일 구조
@@ -132,7 +163,12 @@
 │   ├── population_api.py        # 인구 데이터 수집 (전국/시도/동 단위, 재시도 로직 포함)
 │   ├── hospital_api.py          # 병의원 데이터 수집 (심평원 실시간 연동, 34개 과목)
 │   └── data_merge.py            # 데이터 병합, 코드 표준화 및 지수 산출
+├── scripts/                     # DB 마이그레이션 및 관리 스크립트 모음
+│   ├── create_local_db.py       # 원본 엑셀 파일을 SQLite DB로 파싱 생성
+│   ├── migrate_to_supabase.py   # 구축된 로컬 DB를 Supabase로 Bulk Insert
+│   └── update_db_from_api.py    # 공공 API 주기적 호출로 DB 최신화 (배치용)
 ├── data/
+│   ├── saturation.db            # 생성된 중심 Local SQLite 데이터베이스 파일
 │   └── geojson/
 │       ├── national_dong.geojson  # 전국 행정동 경계 (원본)
 │       └── seoul_dong.geojson     # 서울 전용 (백업용)
@@ -195,19 +231,103 @@
 | 의원수/전문의수 0개 | `clCd=31,21,11` 다중값 → HIRA API 0건 반환 | 단일값만 전달, 복수 시 파라미터 생략 |
 | `RemoteDisconnected` | sido 레벨 연속 POST 50+ 건 → JUMIN 서버 강제 종료 | 3회 재시도 + 세션 재생성 + 구 간 0.8초 딜레이 |
 | 병의원 API 오류 무시 | HTTP 200이어도 XML 내 오류코드 존재 | `_parse_response`에서 `resultCode != "00"` 감지 후 예외 발생 |
-| 네이버 지도 검색 실패 | 전체 주소(번지수 포함) 사용 시 검색 불일치 | 검색 쿼리를 `병원명 + 시도명 + 동명`으로 축소 |
+| 네이버 지도 검색 실패 | 전체 주소 또는 시도코드 노출 시 검색 불일치 | 검색 쿼리를 가장 정확도 높은 `병원명 + 시군구명(예: 광진구)` 조합으로 개선 |
+| 개설일자 "정보 없음" 처리 | SQLite 이관 과정에서 `YYYYMMDD 00:00:00` 문자열 저장 | 공백 기준 `split()` 후 앞자리 날짜만 추출하도록 파싱 파이프라인 강화 |
 | 버튼 글자색 미적용 | Streamlit이 버튼 내부 `<p>` 태그에 별도 색상 지정 | CSS 선택자에 `*` 자식 선택자 추가로 모든 하위 요소 강제 적용 |
 | 지도·막대 색상 불일치 | 지도는 SI 연속값 기반, 막대는 등급 기반 색상 사용 | 지도를 `saturation_level` 기반 이산 4색으로 교체하여 동일 색 체계 통일 |
+| sido 분석에서 수원시·고양시·용인시 등이 구 단위로 분리 표시 | `get_sgg_list`가 시·구 레벨을 모두 반환 → 각 구마다 별도 match_key 생성 | `existing_sgg_codes` 집합 빌드 후 `city_5 in sgg_codes` 체크로 구→시 통합; 인구 합산 처리 추가 |
+| 부천시 sido 분석 시 의원 0개 표시 | 구폐지(2016) 후 population DB는 구 코드(41192 등) 유지, GeoJSON은 통합 코드(41190) 사용 → match_key 불일치 | `existing_sgg_codes` 체크 동일 로직으로 4119x → 41190 통합 처리 |
+| sido dissolve 후 구 경계가 별도 폴리곤으로 남음 | `dissolve_key = gdf["adm_cd2"].str[:5]` 단순 슬라이싱이 구 코드(41111 등)를 그대로 사용 | `app.py`의 dissolve_key 계산을 `existing_sgg_codes` 기반 동적 판별로 교체 |
 
 ---
 
-### 9. 향후 과제
+### 9. 향후 과제 (Next Steps)
 
-| 과제 | 중요도 | 비고 |
-|------|--------|------|
-| 파일 기반 영구 캐시 도입 | 높음 | API 일일 할당량 보호 및 응답 속도 향상 |
-| GeoJSON 최신화 (2025년형) | 중간 | 신규 행정동(개포3동 등) 누락분 반영 |
-| 진료과목별 가중치 세분화 | 낮음 | 특정 과목별 전문의 vs 일반의 가중치 차등 적용 |
-| sido 레벨 인구 API 병렬 요청 | 중간 | 현재 순차 수집(25개 구 × 0.8초) → asyncio 전환 시 속도 대폭 향상 가능 |
+로컬 DB 기반 아키텍처 개편 및 UI 고도화가 1차적으로 완료됨에 따라, 앞으로 시스템을 더 발전시키기 위해 다음 단계들을 계획할 수 있습니다.
+
+#### ✅ 채택된 데이터 업데이트 방식: Excel 수동 재적재
+
+> **API 자동화 방식은 채택하지 않습니다.**
+>
+> 검토 결과, 공공데이터 API 자동화(scripts/update_db_from_api.py)는 아래 이유로 현실적이지 않다고 판단되었습니다.
+> - **병원 데이터**: HIRA API의 `sgguCd`(API 코드)와 DB에 저장된 Excel 기반 `sigungu_cd` 코드 체계가 불일치하여 업데이트 시 데이터 정합성 문제 발생
+> - **인구 데이터**: 행안부 JUMIN API는 세션 인증·연결 끊김 등 안정성 문제로 자동화 난이도가 높으며, `update_db_from_api.py` 내에도 미구현 상태
+> - **갱신 주기**: 두 데이터 모두 월 1회 갱신이므로 자동화의 실익이 크지 않음
+>
+> 대신 **월 1회 Excel 수동 재적재** 방식을 채택합니다.
+
+**정기 업데이트 절차 (월 1회):**
+
+```
+1. 공공데이터포털에서 최신 Excel 파일 다운로드
+   - 병원: 심평원 "전국 병의원 및 약국 현황" (1.병원정보서비스, 5.진료과목정보)
+   - 인구: 행안부 "주민등록 인구 및 세대현황" (월별), "연령별 인구현황" (월별)
+
+2. 다운로드한 파일을 DB_data/ 폴더에 덮어쓰기
+
+3. DB 재구축 실행 (약 5~15분)
+   python scripts/create_local_db.py
+
+4. (Supabase 사용 시) 온라인 DB 동기화
+   python scripts/migrate_to_supabase.py
+```
+
+---
+
+| 단계 (Phase) | 과제명 | 세부 내용 및 목표 | 중요도 |
+|--------------|--------|-------------------|--------|
+| **Step 1** | **정기 Excel 재적재 환경 정비** | `DB_data/` 폴더 내 파일 명명 규칙을 `create_local_db.py`와 일치시키고, 업데이트 절차를 내부 문서화. `update_db_from_api.py`는 참고용으로 보관하되 실운용에서는 사용하지 않음. | 높음 |
+| **Step 2** | **지도 폴리곤 최신화** | 2024~2025년 사이 신설되거나 통폐합된 행정동(예: 상일1동, 개포3동 등)의 최신 공간 데이터(GeoJSON)를 교체하여 지도상에 나타나지 않는 블랭크 지역 완벽 해소. | 중간 |
+| **Step 3** | **온라인 DB (Supabase) 배포** | Streamlit 웹앱을 타인에게 배포하거나 호스팅(Streamlit Cloud 등) 환경으로 전환할 시기 도래 시 적용. `migrate_to_supabase.py`는 이미 완성됨. 단, 웹앱 코드(`population_api.py`, `hospital_api.py`)의 DB 연결부를 SQLite → Supabase 클라이언트로 교체해야 함. 변경 파일 목록은 아래 참조. | 선택 |
+| **Step 4** | **AI 입지 분석 리포트 도입** | Gemini API 등 LLM을 연동. 사용자가 분석 실행 시 "포화도는 1.5로 여유로우며, 배후 11만 세대 대비 내과 개원이 매우 유리합니다" 와 같은 텍스트 기반 인사이트 요약 패널 추가. | 장기 |
+
+---
+
+### 10. 온라인 DB 이관 계획 (Supabase)
+
+> **현재 미진행 — 향후 외부 배포(Streamlit Cloud 등) 시점에 실행**
+
+#### 접근 방식: psycopg2 직접 연결
+Supabase는 PostgreSQL 기반이므로 `psycopg2`로 직접 연결한다.
+현재 코드의 `pd.read_sql_query(query, conn)` 패턴을 그대로 유지할 수 있어 코드 변경이 최소화된다.
+`.env`에 `SUPABASE_DB_URL` 설정 여부로 SQLite(로컬) ↔ Supabase(온라인)를 자동 전환한다.
+
+#### 수정 필요 파일
+
+| 파일 | 변경 내용 | 난이도 |
+|------|-----------|--------|
+| `.env` | `SUPABASE_DB_URL=postgresql://postgres:[password]@db.[ref].supabase.co:5432/postgres` 추가 | 매우 쉬움 |
+| `config.py` | `SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "")` 1줄 추가 | 매우 쉬움 |
+| `modules/population_api.py` | `_get_conn()` 수정: SUPABASE_DB_URL 있으면 `psycopg2.connect()`, 없으면 기존 `sqlite3.connect()` | 쉬움 |
+| `modules/hospital_api.py` | 동일 + `_ph()` 헬퍼 추가(SQLite=`?`, PostgreSQL=`%s`) + 쿼리 내 `?` → `{_ph()}` 교체 | 중간 |
+| `scripts/migrate_to_supabase.py` | REST API 방식 → psycopg2 방식으로 재작성. ① 테이블 DDL 생성 → ② SQLite 읽기 → ③ TRUNCATE → ④ bulk INSERT (`execute_values`, 500건 단위) | 중간 |
+| `requirements.txt` | `psycopg2-binary>=2.9.0` 추가 | 매우 쉬움 |
+
+#### 변경 불필요 파일
+
+| 파일 | 이유 |
+|------|------|
+| `app.py` | 모듈 인터페이스 유지, 수정 불필요 |
+| `modules/data_merge.py` | 동일 |
+| `scripts/create_local_db.py` | 로컬 DB 구축용, Supabase와 무관하게 계속 사용 |
+| `data/geojson/` | 변경 없음 |
+
+#### SQL 호환성 메모
+
+| 항목 | SQLite | PostgreSQL |
+|------|--------|-----------|
+| 플레이스홀더 | `?` | `%s` |
+| LIKE 패턴 | 동일 | 동일 (단, 인덱스는 `text_pattern_ops` 필요) |
+| f-string 쿼리 | 동일 | 동일 |
+| `pd.read_sql_query` | 동일 | 동일 |
+
+#### 실행 순서 (이관 시점 도래 시)
+```
+1. pip install psycopg2-binary
+2. .env에 SUPABASE_DB_URL 추가
+   (Supabase 대시보드 → Settings → Database → Connection string → URI)
+3. python scripts/migrate_to_supabase.py   # 로컬 SQLite → Supabase 복사 (5~20분)
+4. streamlit run app.py                    # 자동으로 Supabase 사용
+```
 
 ---

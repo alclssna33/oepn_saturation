@@ -1,19 +1,19 @@
 """
-행정안전부 행정동별 주민등록 인구 데이터 수집 모듈
+행정안전부 행정동별 주민등록 인구 데이터 수집 모듈 (로컬 DB버전)
 """
 
-import re
-import time
-import requests
+import sqlite3
 import pandas as pd
+import os
 
-_RDOA_BASE = "https://rdoa.jumin.go.kr/openStats"
-_JUMIN_BASE = "https://jumin.mois.go.kr"
+# DB 경로 설정
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(BASE_DIR, 'data', 'saturation.db')
 
-_DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "ko-KR,ko;q=0.9",
-}
+def _get_conn():
+    if not os.path.exists(DB_PATH):
+        raise FileNotFoundError(f"로컬 DB를 찾을 수 없습니다: {DB_PATH}")
+    return sqlite3.connect(DB_PATH)
 
 SIDO_CODES = {
     "서울특별시": "1100000000", "부산광역시": "2600000000", "대구광역시": "2700000000",
@@ -24,150 +24,126 @@ SIDO_CODES = {
     "경상남도": "4800000000", "제주특별자치도": "5000000000",
 }
 
-def _to_int(val: str) -> int:
-    if not val: return 0
-    clean = re.sub(r"[^0-9]", "", val)
-    return int(clean) if clean.isdigit() else 0
-
-def _parse_table_rows(html: str, min_cols: int = 2) -> list[list[str]]:
-    rows_raw = re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.DOTALL | re.IGNORECASE)
-    result = []
-    for row in rows_raw:
-        cells = [re.sub(r"<[^>]+>", "", c).strip() for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.DOTALL | re.IGNORECASE)]
-        if len(cells) >= min_cols and cells[0]:
-            result.append(cells)
-    return result
-
 class PopulationAPIClient:
-    def __init__(self, request_delay: float = 0.3):
+    def __init__(self, request_delay: float = 0.0):
+        # DB 기반이므로 delay는 무시하지만 호환성을 위해 유지
         self._delay = request_delay
-        self._rdoa_session = requests.Session()
-        self._rdoa_session.headers.update(_DEFAULT_HEADERS)
-        self._jumin_session = requests.Session()
-        self._jumin_session.headers.update(_DEFAULT_HEADERS)
-        self._rdoa_jsid: str = ""
-        self._jumin_initialized: bool = False
-
-    def _init_rdoa_session(self) -> None:
-        r = self._rdoa_session.get(f"{_RDOA_BASE}/selectConAdmmPpltnHh", timeout=10)
-        match = re.search(r"jsessionid=([A-Za-z0-9+._-]+)", r.text)
-        self._rdoa_jsid = match.group(1) if match else ""
-
-    def _init_jumin_session(self) -> None:
-        if not self._jumin_initialized:
-            self._jumin_session.get(f"{_JUMIN_BASE}/ageStatMonth.do", timeout=10)
-            self._jumin_initialized = True
-
-    def _reset_jumin_session(self) -> None:
-        """연결 끊김(RemoteDisconnected) 발생 시 세션을 새로 생성"""
-        self._jumin_session = requests.Session()
-        self._jumin_session.headers.update(_DEFAULT_HEADERS)
-        self._jumin_initialized = False
 
     def get_sgg_list(self, sido_cd: str) -> pd.DataFrame:
-        if not self._rdoa_jsid: self._init_rdoa_session()
-        r = self._rdoa_session.get(f"{_RDOA_BASE}/selectSggList;jsessionid={self._rdoa_jsid}", params={"admmCd": sido_cd[:2]}, timeout=10)
-        data = r.json() if r.text.strip().startswith("[") else []
-        return pd.DataFrame(data)[["admmCd", "ctpvNm", "sggNm"]] if data else pd.DataFrame()
+        """
+        특정 시도의 시군구 목록을 반환합니다.
+        기존 반환 컬럼: admmCd, ctpvNm, sggNm
+        """
+        prefix = sido_cd[:2]
+        query = f"SELECT adm_cd, adm_nm FROM population_house WHERE adm_cd LIKE '{prefix}%00000' AND adm_cd != '{prefix}00000000'"
+        
+        with _get_conn() as conn:
+            df = pd.read_sql_query(query, conn)
+            
+        if df.empty:
+            return pd.DataFrame()
+            
+        # ctpvNm (시도명), sggNm (시군구명) 분리
+        df['ctpvNm'] = df['adm_nm'].apply(lambda x: x.split()[0] if isinstance(x, str) else "")
+        df['sggNm'] = df['adm_nm'].apply(lambda x: x.split()[1] if isinstance(x, str) and len(x.split()) > 1 else "")
+        df.rename(columns={'adm_cd': 'admmCd'}, inplace=True)
+        return df[['admmCd', 'ctpvNm', 'sggNm']]
 
     def get_population(self, sgg_cd: str, year_month: str = "202412", lv: str = "3") -> pd.DataFrame:
-        if not self._rdoa_jsid: self._init_rdoa_session()
-        year, month = year_month[:4], year_month[4:6].zfill(2)
-        target_cd = "0000000000" if lv == "1" else (sgg_cd[:2] + "00000000" if lv == "2" else sgg_cd)
+        """
+        세대수 및 기본 인구 데이터를 반환합니다.
+        lv 1: 전국 시도, lv 2: 특정 시도 내 시군구, lv 3: 특정 시군구 내 행정동
+        """
+        with _get_conn() as conn:
+            if lv == "1":
+                query = "SELECT * FROM population_house WHERE adm_cd LIKE '%00000000'"
+            elif lv == "2":
+                prefix = sgg_cd[:2]
+                query = f"SELECT * FROM population_house WHERE adm_cd LIKE '{prefix}%00000' AND adm_cd != '{prefix}00000000'"
+            else: # lv == "3"
+                prefix = sgg_cd[:5]
+                query = f"SELECT * FROM population_house WHERE adm_cd LIKE '{prefix}%' AND adm_cd != '{prefix}00000'"
+                
+            df = pd.read_sql_query(query, conn)
+            
+        if df.empty:
+            return pd.DataFrame()
 
-        all_rows = []
-        page = 1
-        while True:
-            payload = {
-                "ctpvCd": sgg_cd[:2] if lv != "1" else "", "sggCd": sgg_cd if lv == "3" else "",
-                "dongCd": "", "lv": lv, "regSeCd": "1",
-                "srchFrYear": year, "srchFrMon": month, "srchToYear": year, "srchToMon": month,
-                "curPage": str(page), "paramUrl": f"admmCd={target_cd}&lv={lv}&regSeCd=1&srchFrYm={year_month}&srchToYm={year_month}"
-            }
-            r = self._rdoa_session.post(f"{_RDOA_BASE}/selectConAdmmPpltnHh;jsessionid={self._rdoa_jsid}", data=payload, timeout=20)
-            rows = _parse_table_rows(r.text)
-            if not rows: break
-            all_rows.extend(rows)
-            if len(rows) < 10: break
-            page += 1
-            time.sleep(self._delay)
-
-        data = []
-        for row in all_rows:
-            if len(row) < 8: continue
-            row_str = "".join(row)
-            if "전국" in row[0] or "소계" in row_str or "합계" in row_str: continue
-            entry = {
-                "통계년월": row[0].replace(".", ""), "admmCd": str(row[1]), "시도명": row[2],
-                "시군구명": row[3] if len(row) > 3 else "",
-                "행정동명": row[4] if lv == "3" else (row[3] if lv == "2" else row[2]),
-                "총인구수": _to_int(row[-6]), "세대수": _to_int(row[-5]), "남자인구수": _to_int(row[-3]), "여자인구수": _to_int(row[-2]),
-            }
-            data.append(entry)
+        # 호환성 위해 이름 변경
+        df.rename(columns={
+            'adm_cd': 'admmCd',
+            'total_pop': '총인구수',
+            'households': '세대수',
+            'male_pop': '남자인구수',
+            'female_pop': '여자인구수'
+        }, inplace=True)
         
-        df = pd.DataFrame(data)
-        if not df.empty:
-            for col in ["총인구수", "세대수", "남자인구수", "여자인구수"]:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype('int64')
-        return df.drop_duplicates(subset=["admmCd"]).reset_index(drop=True)
+        # 이름 분리
+        df['시도명'] = df['adm_nm'].apply(lambda x: x.split()[0] if isinstance(x, str) else "")
+        df['시군구명'] = df['adm_nm'].apply(lambda x: x.split()[1] if isinstance(x, str) and len(x.split()) > 1 else "")
+        df['행정동명'] = df['adm_nm'].apply(lambda x: x.split()[2] if isinstance(x, str) and len(x.split()) > 2 else "")
+        
+        # 기초 체계 정리 (기존 API 형식 호환)
+        df['통계년월'] = year_month
+        return df
 
     def get_age_population(self, sgg_cd: str, year_month: str = "202412", lv: str = "3") -> pd.DataFrame:
-        import calendar
-        year, month = year_month[:4], year_month[4:6].zfill(2)
-        last_day = calendar.monthrange(int(year), int(month))[1]
-        org_type = {"1": "1", "2": "2", "3": "3"}.get(lv, "3")
-        lvl1 = "0000000000" if lv == "1" else sgg_cd[:2] + "00000000"
-        lvl2 = "0000000000" if lv == "1" else (sgg_cd[:2] + "00000000" if lv == "2" else sgg_cd)
+        """
+        연령별 인구 데이터를 반환합니다.
+        """
+        with _get_conn() as conn:
+            if lv == "1":
+                query = "SELECT * FROM population_age WHERE adm_cd LIKE '%00000000'"
+            elif lv == "2":
+                prefix = sgg_cd[:2]
+                query = f"SELECT * FROM population_age WHERE adm_cd LIKE '{prefix}%00000' AND adm_cd != '{prefix}00000000'"
+            else: # lv == "3"
+                prefix = sgg_cd[:5]
+                query = f"SELECT * FROM population_age WHERE adm_cd LIKE '{prefix}%' AND adm_cd != '{prefix}00000'"
+                
+            df = pd.read_sql_query(query, conn)
 
-        payload = {
-            "tableChart": "T", "sltOrgType": org_type, "nowYear": "2025",
-            "sltOrgLvl1": lvl1, "sltOrgLvl2": lvl2, "gender": "gender", "sum": "sum",
-            "searchYearStart": year, "searchMonthStart": month, "searchYearEnd": year, "searchMonthEnd": month,
-            "sltOrderType": "1", "sltOrderValue": "ASC", "sltArgTypes": "10", "category": "month",
-            "startOrtnDe": f"{year}{month}01", "endOrtnDe": f"{year}{month}{last_day:02d}", "searchYearMonth": "month",
-        }
+        if df.empty:
+            return pd.DataFrame()
 
-        # 서버 연결 끊김 대비: 최대 3회 재시도 + 세션 재생성
-        _MAX_RETRY = 3
-        for attempt in range(_MAX_RETRY):
-            try:
-                self._init_jumin_session()
-                r = self._jumin_session.post(f"{_JUMIN_BASE}/ageStatMonth.do", data=payload, timeout=30)
-                break  # 성공 시 루프 탈출
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-                if attempt < _MAX_RETRY - 1:
-                    self._reset_jumin_session()
-                    time.sleep(2 ** attempt)  # 1s → 2s → 4s 지수 백오프
-                else:
-                    return pd.DataFrame()  # 3회 모두 실패 시 빈 DataFrame
-        rows = _parse_table_rows(r.text)
-        if not rows: return pd.DataFrame()
-        df_rows = []
-        for row in rows:
-            if len(row) < 13: continue
-            admm_cd = str(row[0])
-            if not admm_cd.isdigit() or admm_cd == "0000000000": continue
-            age_vals = row[2:]
-            entry = {"admmCd": admm_cd, "행정동명": row[1]}
-            age_names = ["총인구수", "_v", "0_9세", "10_19세", "20_29세", "30_39세", "40_49세", "50_59세", "60_69세", "70_79세", "80_89세", "90_99세", "100세이상"]
-            for i, nm in enumerate(age_names):
-                if i < len(age_vals) and not nm.startswith("_"): entry[nm] = _to_int(age_vals[i])
-            entry["20세이하인구"] = entry.get("0_9세", 0) + entry.get("10_19세", 0)
-            entry["20_40세인구"] = entry.get("20_29세", 0) + entry.get("30_39세", 0)
-            entry["40_60세인구"] = entry.get("40_49세", 0) + entry.get("50_59세", 0)
-            entry["60세이상인구"] = entry.get("60_69세", 0) + entry.get("70_79세", 0) + entry.get("80_89세", 0) + entry.get("90_99세", 0) + entry.get("100세이상", 0)
-            df_rows.append(entry)
-        res_df = pd.DataFrame(df_rows)
-        if not res_df.empty:
-            for c in res_df.columns:
-                if c not in ["admmCd", "행정동명"]:
-                    res_df[c] = pd.to_numeric(res_df[c], errors='coerce').fillna(0).astype('int64')
-        return res_df.reset_index(drop=True)
+        df.rename(columns={
+            'adm_cd': 'admmCd',
+            'adm_nm': '행정동명',
+            'total_pop': '총인구수',
+            'age_0_9': '0_9세',
+            'age_10_19': '10_19세',
+            'age_20_29': '20_29세',
+            'age_30_39': '30_39세',
+            'age_40_49': '40_49세',
+            'age_50_59': '50_59세',
+            'age_60_69': '60_69세',
+            'age_70_79': '70_79세',
+            'age_80_89': '80_89세',
+            'age_90_99': '90_99세',
+            'age_100_plus': '100세이상'
+        }, inplace=True)
+        
+        # 합산 컬럼 (호환성 목적)
+        df["20세이하인구"] = df.get("0_9세", 0) + df.get("10_19세", 0)
+        df["20_40세인구"] = df.get("20_29세", 0) + df.get("30_39세", 0)
+        df["40_60세인구"] = df.get("40_49세", 0) + df.get("50_59세", 0)
+        df["60세이상인구"] = df.get("60_69세", 0) + df.get("70_79세", 0) + df.get("80_89세", 0) + df.get("90_99세", 0) + df.get("100세이상", 0)
+
+        # 시스템 상 행정동명은 마지막 단어만 (읍면동) 리턴했었음
+        if lv == "3":
+            df['행정동명'] = df['행정동명'].apply(lambda x: x.split()[-1] if isinstance(x, str) else "")
+
+        return df
 
     def get_merged(self, sgg_cd: str, year_month: str = "202412", lv: str = "3") -> pd.DataFrame:
         pop_df = self.get_population(sgg_cd, year_month, lv=lv)
-        time.sleep(self._delay)
         age_df = self.get_age_population(sgg_cd, year_month, lv=lv)
+        
         if pop_df.empty: return age_df
         if age_df.empty: return pop_df
-        return pop_df.merge(age_df.drop(columns=["행정동명", "총인구수"], errors="ignore"), on="admmCd", how="left")
+        
+        # join 시 중복 컬럼 제거 (행정동명, 총인구수)
+        drop_cols = ["행정동명", "총인구수"]
+        age_df_clean = age_df.drop(columns=[c for c in drop_cols if c in age_df.columns], errors="ignore")
+        
+        return pop_df.merge(age_df_clean, on="admmCd", how="left")

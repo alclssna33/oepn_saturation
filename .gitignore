@@ -15,6 +15,11 @@ data/raw/
 *.xlsx
 *.json
 
+# DB 파일 (용량 대용량 - git 제외)
+DB_data/
+data/saturation.db
+*.db
+
 # 예외: GeoJSON은 필요시 포함
 !data/geojson/
 

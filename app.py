@@ -156,8 +156,12 @@ def _load_data(sgg_cd_pop, hira_sido_cd, sgg_name, specialty_codes, year_month, 
         gdf["adm_cd2"] = gdf["adm_cd2"].apply(_standardize_code)
         if analysis_level == "national": gdf["dissolve_key"] = gdf["adm_cd2"].str[:2]
         else:
-            prefix = _standardize_code(sgg_cd_pop)[:2]
-            gdf["dissolve_key"] = gdf["adm_cd2"].str[:5]
+            prefix = sgg_cd_pop[:2]
+            sgg_codes = res.get("sgg_codes", set())
+            def _mk(adm_cd: str) -> str:
+                c = adm_cd[:4] + "0"
+                return c if c in sgg_codes else adm_cd[:5]
+            gdf["dissolve_key"] = gdf["adm_cd2"].apply(_mk)
             gdf = gdf[gdf["dissolve_key"].str.startswith(prefix)].copy()
         dissolved = gdf.dissolve(by="dissolve_key").reset_index()
         dissolved["adm_cd2"] = dissolved["dissolve_key"]
@@ -269,9 +273,11 @@ def _show_hospital_detail(hosp: pd.Series, all_hosp_df: pd.DataFrame) -> None:
     ykiho   = str(hosp.get("ykiho", "") or "")
     dr_tot  = int(hosp.get("drTotCnt", 0) or 0)
     sdr_cnt = int(hosp.get("mdeptSdrCnt", 0) or 0)
-    estb    = str(hosp.get("estbDd", "") or "")
+    estb    = str(hosp.get("estbDd", "") or "").strip()
 
-    estb_fmt = f"{estb[:4]}-{estb[4:6]}-{estb[6:]}" if (len(estb) == 8 and estb.isdigit()) else "정보 없음"
+    # Pandas SQLite 저장 시 '20140102 00:00:00' 형태로 들어갈 수 있음
+    estb_clean = estb.split()[0].replace("-", "") if estb else ""
+    estb_fmt = f"{estb_clean[:4]}-{estb_clean[4:6]}-{estb_clean[6:8]}" if len(estb_clean) >= 8 and estb_clean[:8].isdigit() else "정보 없음"
 
     # 같은 ykiho를 가진 모든 행에서 진료과목 수집
     if ykiho and not all_hosp_df.empty and "ykiho" in all_hosp_df.columns:
@@ -305,9 +311,11 @@ def _show_hospital_detail(hosp: pd.Series, all_hosp_df: pd.DataFrame) -> None:
     c3.metric("개설일자", estb_fmt)
 
     st.divider()
-    sido_nm = str(hosp.get("sidoCdNm", "") or "")
-    dong_nm = str(hosp.get("emdongNm", "") or "")
-    naver_url = f"https://map.naver.com/v5/search/{quote(f'{name} {sido_nm} {dong_nm}'.strip())}"
+    addr = str(hosp.get("addr", "") or "")
+    # 주소 텍스트에서 강진구, 광진구 등 2번째 단어(시군구명) 추출
+    parts = addr.split()
+    sgg_nm = parts[1] if len(parts) > 1 else ""
+    naver_url = f"https://map.naver.com/v5/search/{quote(f'{name} {sgg_nm}'.strip())}"
     _, btn_col, _ = st.columns([1, 2, 1])
     with btn_col:
         st.link_button("📍 네이버 지도에서 보기", naver_url, use_container_width=True, type="primary")
@@ -409,31 +417,7 @@ if "results" in st.session_state:
     sp_names   = st.session_state["sp_names"]
 
     # ── 디버그 (기본 접힘) ─────────────────────────────────────────────
-    with st.expander("🛠️ 데이터 매칭 디버그", expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            st.write("**인구 데이터 샘플**")
-            if not pop_df.empty:
-                st.dataframe(pop_df[["match_key", "행정동명", "총인구수"]].head(5), use_container_width=True)
-                st.caption(f"Key 타입: {type(pop_df['match_key'].iloc[0])}")
-            else:
-                st.warning("인구 데이터 없음")
-        with c2:
-            st.write("**병원 집계 샘플**")
-            if not hosp_summary.empty:
-                st.dataframe(hosp_summary[["match_key", "specialty_nm", "clinic_count"]].head(5), use_container_width=True)
-                st.caption(f"Key 타입: {type(hosp_summary['match_key'].iloc[0])}")
-            else:
-                st.warning("병원 데이터 없음 (집계 실패)")
-        if not pop_df.empty and not hosp_summary.empty:
-            common = set(pop_df["match_key"]) & set(hosp_summary["match_key"])
-            st.write(f"공통 키: **{len(common)}개** / 전체 {len(pop_df)}개")
-            if not common:
-                st.error("🚨 키 불일치!")
-                st.write(f"Pop: `{list(pop_df['match_key'].unique()[:5])}`")
-                st.write(f"Hosp: `{list(hosp_summary['match_key'].unique()[:5])}`")
 
-    # ── 진료과목 탭 ────────────────────────────────────────────────────
     tabs = st.tabs(sp_names)
     for tab, sp_nm in zip(tabs, sp_names):
         with tab:

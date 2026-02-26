@@ -3,7 +3,6 @@
 """
 
 import os
-import time
 import warnings
 import json
 from pathlib import Path
@@ -17,14 +16,6 @@ warnings.filterwarnings("ignore", category=UserWarning)
 _NATIONAL_GEOJSON = Path(__file__).parent.parent / "data" / "geojson" / "national_dong.geojson"
 _SEOUL_GEOJSON    = Path(__file__).parent.parent / "data" / "geojson" / "seoul_dong.geojson"
 _DEFAULT_GEOJSON  = _NATIONAL_GEOJSON if _NATIONAL_GEOJSON.exists() else _SEOUL_GEOJSON
-
-_SIDO_CODE_REMAP = {"51": "42", "52": "45"}
-
-def _remap_admm_cd(admm_cd: str) -> str:
-    prefix = str(admm_cd)[:2]
-    if prefix in _SIDO_CODE_REMAP:
-        return _SIDO_CODE_REMAP[prefix] + str(admm_cd)[2:]
-    return str(admm_cd)
 
 def _get_hira_to_pop_map():
     from modules.hospital_api import HIRA_SGG_MAP
@@ -107,7 +98,7 @@ class DataMerger:
         self.geojson_path = Path(geojson_path)
 
     def run(self, sgg_cd_pop: str, hira_sido_cd: str, sgg_name: str = "", specialty_codes: list[str] | None = None,
-            year_month: str = "202412", cl_codes: list[str] | None = None, 
+            year_month: str = "202412", cl_codes: list[str] | None = None,
             num_col: str = "총인구수", den_col: str = "clinic_count",
             analysis_level: str = "dong") -> dict:
         from modules.population_api import PopulationAPIClient, SIDO_CODES
@@ -116,20 +107,31 @@ class DataMerger:
         pop_client = PopulationAPIClient()
         hosp_client = HospitalAPIClient()
         hira_to_pop = _get_hira_to_pop_map()
-        
+
+        # sido _finalize_key에서 사용할 구→시 코드 집합 (non-sido 경우 빈 집합)
+        existing_sgg_codes: set = set()
+        city_name_lookup: dict = {}
+
         # 1. 인구 데이터 수집
         if analysis_level in ["national", "sido"]:
             targets = SIDO_CODES.items() if analysis_level == "national" else [("", sgg_cd_pop)]
             if analysis_level == "sido":
                 sgg_list = pop_client.get_sgg_list(sgg_cd_pop)
                 targets = [(row["sggNm"], row["admmCd"]) for _, row in sgg_list.iterrows()]
+                # sido 전용: 구→시 통합 룩업 빌드
+                existing_sgg_codes = set(str(r["admmCd"])[:5] for _, r in sgg_list.iterrows())
+                for _, r in sgg_list.iterrows():
+                    c10 = str(r["admmCd"])
+                    c5 = c10[:4] + "0"
+                    if c10[:5] == c5:  # 5번째 자리 == "0" → city-level entry
+                        city_name_lookup[c5] = r["sggNm"]
             frames = []
             for idx, (name, code) in enumerate(targets):
-                # 서버 부하 방지: sido/national 레벨은 요청 간 딜레이 추가
-                if idx > 0:
-                    time.sleep(0.8)
                 try:
-                    df = pop_client.get_merged(code, year_month, lv="3")
+                    # national: sido 코드 → lv="2"(시군구 레벨) 사용
+                    # sido:     sgg 코드  → lv="3"(행정동 레벨) 사용
+                    _lv = "2" if analysis_level == "national" else "3"
+                    df = pop_client.get_merged(code, year_month, lv=_lv)
                 except Exception:
                     continue  # 개별 구/시도 실패 시 건너뛰고 계속 진행
                 if not df.empty:
@@ -139,37 +141,47 @@ class DataMerger:
                     num_df = df.select_dtypes(include=['number'])
                     if num_df.empty: continue
                     summ = num_df.sum().to_frame().T
-                    summ["행정동명"] = name if name else df["시도명"].iloc[0]
-                    summ["match_key"] = str(code)[:2] if analysis_level == "national" else str(code)[:5]
+                    if analysis_level == "national":
+                        summ["행정동명"] = name if name else df["시도명"].iloc[0]
+                        summ["match_key"] = str(code)[:2]
+                    else:  # sido
+                        city_5 = str(code)[:4] + "0"
+                        if city_5 in existing_sgg_codes:
+                            summ["match_key"] = city_5
+                            summ["행정동명"] = city_name_lookup.get(city_5, name)
+                        else:
+                            summ["match_key"] = str(code)[:5]
+                            summ["행정동명"] = name if name else df["시도명"].iloc[0]
                     summ["admmCd"] = str(code)
                     frames.append(summ)
             pop_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            # sido 분석: 같은 match_key 행 집계 (구→시 통합, 부천시 코드 불일치 포함)
+            if not pop_df.empty and analysis_level == "sido":
+                num_cols = pop_df.select_dtypes(include='number').columns.tolist()
+                name_first = pop_df.groupby("match_key")["행정동명"].first()
+                pop_df = pop_df.groupby("match_key", as_index=False)[num_cols].sum()
+                pop_df["행정동명"] = pop_df["match_key"].map(name_first)
         else:
             pop_df = pop_client.get_merged(sgg_cd_pop, year_month, lv="3")
             if not pop_df.empty:
-                pop_df["admmCd"] = pop_df["admmCd"].apply(_remap_admm_cd)
                 pop_df["match_key"] = pop_df["admmCd"].astype(str)
 
-        # 2. 병원 데이터 수집
+        # 2. 병원 데이터 수집 (DB 직접 조회)
+        # DB는 sido_cd 단위로 조회 후 spatial join(GPS)으로 행정동 배정
+        # → HIRA_SGG_MAP 기반 sgg 코드 루프 불필요 (Excel 코드와 불일치 문제 해결)
         h_frames = []
         if analysis_level == "national":
-            for h_sgg in HIRA_SGG_MAP.values():
+            for sido_cd in HIRA_SIDO_CODES.values():
                 try:
-                    df = hosp_client.get_hospitals_multi(h_sgg[:2]+"0000", sgg_cd=h_sgg, specialty_codes=specialty_codes, cl_codes=cl_codes)
-                    if not df.empty: h_frames.append(df)
-                except: pass
-        elif analysis_level == "sido":
-            sido_prefix = sgg_cd_pop[:2]
-            target_h_sggs = [v for k, v in HIRA_SGG_MAP.items() if k.startswith(sido_prefix)]
-            for h_sgg in target_h_sggs:
-                try:
-                    df = hosp_client.get_hospitals_multi(hira_sido_cd, sgg_cd=h_sgg, specialty_codes=specialty_codes, cl_codes=cl_codes)
+                    df = hosp_client.get_hospitals_multi(sido_cd, sgg_cd=None, specialty_codes=specialty_codes, cl_codes=cl_codes)
                     if not df.empty: h_frames.append(df)
                 except: pass
         else:
-            hira_sgg_cd = HIRA_SGG_MAP.get(sgg_cd_pop[:5])
-            df = hosp_client.get_hospitals_multi(hira_sido_cd, sgg_cd=hira_sgg_cd, specialty_codes=specialty_codes, cl_codes=cl_codes)
-            if not df.empty: h_frames.append(df)
+            # sido / dong 공통: sido_cd 한 번에 조회, sgg 구분은 spatial join이 처리
+            try:
+                df = hosp_client.get_hospitals_multi(hira_sido_cd, sgg_cd=None, specialty_codes=specialty_codes, cl_codes=cl_codes)
+                if not df.empty: h_frames.append(df)
+            except: pass
         
         # h_frames가 비어있으면 컬럼 스키마를 보존한 빈 DataFrame 사용 (pd.DataFrame()은 컬럼 없음)
         hosp_all = pd.concat(h_frames, ignore_index=True) if h_frames else pd.DataFrame(columns=HOSPITAL_COLUMNS)
@@ -185,7 +197,9 @@ class DataMerger:
                 elif adm.startswith("45"): pref = "52"
                 else: pref = adm[:2]
                 if analysis_level == "national": return pref
-                if analysis_level == "sido": return pref + adm[2:5]
+                if analysis_level == "sido":
+                    city_5 = pref + adm[2:4] + "0"
+                    return city_5 if city_5 in existing_sgg_codes else pref + adm[2:5]
                 return pref + adm[2:10]
             
             p_sgg = hira_to_pop.get(str(_safe_val(row, "sgguCd")))
@@ -207,4 +221,6 @@ class DataMerger:
 
         # 4. 결과 산출
         results = {cd: calc_saturation_index(merge_with_population(pop_df, hosp_summary, cd), num_col, den_col) for cd in specialty_codes}
-        return {"population": pop_df, "hospitals": hosp_mapped, "hospital_summary": hosp_summary, "saturation": results, "analysis_level": analysis_level}
+        return {"population": pop_df, "hospitals": hosp_mapped, "hospital_summary": hosp_summary,
+                "saturation": results, "analysis_level": analysis_level,
+                "sgg_codes": existing_sgg_codes}
