@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 from shapely.geometry import Point
 
@@ -107,6 +108,108 @@ def enrich_with_apt_price(si_df: pd.DataFrame, analysis_level: str) -> pd.DataFr
             sido_agg["avg_price_per_pyeong"] = sido_agg["avg_price_per_pyeong"].astype(int)
             sido_agg = sido_agg.rename(columns={"mk2": "match_key"})
             df = df.merge(sido_agg, on="match_key", how="left")
+
+        return df
+
+    except Exception:
+        return si_df
+
+
+# ── 개비공 소득지수 산출 ────────────────────────────────────────────────────────
+def calc_income_index(si_df: pd.DataFrame, analysis_level: str) -> pd.DataFrame:
+    """
+    개비공 소득지수 산출 및 S/A/B/C/D 등급 부여.
+
+    복합지수 = 평당가_로그스코어 × 0.7 + 경제활동연령비율_스코어 × 0.3
+    전국 전체 데이터 기준으로 정규화 → 분석 지역과 무관하게 일관된 등급 체계.
+    아파트 거래 데이터 없는 동(avg_price_per_pyeong IS NULL or 0)은 income_grade=None.
+    """
+    if "avg_price_per_pyeong" not in si_df.columns:
+        return si_df
+    try:
+        conn = sqlite3.connect(_DB_PATH)
+
+        # 1) 전국 hjd_cd별 가중평균 평당가
+        price_all = pd.read_sql_query(
+            """
+            SELECT r.hjd_cd,
+                   CAST(SUM(a.avg_price_per_pyeong * a.trade_count) * 1.0
+                        / SUM(a.trade_count) AS INTEGER) AS price
+            FROM region_code_mapping r
+            JOIN apt_price_bjd a ON r.bjd_cd = a.bjd_cd
+            WHERE r.hjd_cd IS NOT NULL AND LENGTH(r.hjd_cd) = 10
+            GROUP BY r.hjd_cd
+            """,
+            conn,
+        )
+
+        # 2) 전국 행정동별 경제활동 연령 비율 (30~59세 / total_pop)
+        age_all = pd.read_sql_query(
+            """
+            SELECT adm_cd,
+                   CAST(age_30_39 + age_40_49 + age_50_59 AS REAL)
+                   / NULLIF(total_pop, 0) AS active_ratio
+            FROM population_age
+            WHERE total_pop > 0
+            """,
+            conn,
+        )
+        conn.close()
+
+        # 3) 로그 정규화 (평당가 — 고왜도 완화)
+        price_all["log_p"] = np.log2(price_all["price"].clip(lower=1).astype(float))
+        p_min, p_max = price_all["log_p"].min(), price_all["log_p"].max()
+        price_all["price_score"] = (price_all["log_p"] - p_min) / (p_max - p_min) * 100
+
+        # 4) 경제활동 비율 min-max 정규화
+        r_min, r_max = age_all["active_ratio"].min(), age_all["active_ratio"].max()
+        age_all["active_score"] = (age_all["active_ratio"] - r_min) / (r_max - r_min) * 100
+
+        # 5) match_key 생성 (analysis_level에 따라 앞 N자리)
+        mk_len = {"dong": 10, "sido": 5, "national": 2}.get(analysis_level, 10)
+        price_all["mk"] = price_all["hjd_cd"].str[:mk_len]
+        age_all["mk"]   = age_all["adm_cd"].str[:mk_len]
+
+        # 6) 집계 (sido/national은 여러 행정동 평균)
+        price_agg = price_all.groupby("mk")["price_score"].mean().reset_index()
+        age_agg   = age_all.groupby("mk")["active_score"].mean().reset_index()
+
+        # 7) 복합 지수
+        global_df = price_agg.merge(age_agg, on="mk", how="outer")
+        global_df["composite"] = (
+            global_df["price_score"].fillna(0) * 0.7 +
+            global_df["active_score"].fillna(0) * 0.3
+        )
+
+        # 8) 전국 기준 quintile 분위수 → S/A/B/C/D
+        valid_comp = global_df["composite"].dropna()
+        t20, t40, t60, t80 = valid_comp.quantile([0.2, 0.4, 0.6, 0.8]).values
+
+        def _grade(v):
+            if pd.isna(v):
+                return None
+            if v >= t80:
+                return "S"
+            if v >= t60:
+                return "A"
+            if v >= t40:
+                return "B"
+            if v >= t20:
+                return "C"
+            return "D"
+
+        global_df["income_grade"] = global_df["composite"].apply(_grade)
+
+        # 9) si_df에 조인
+        grade_map = global_df.set_index("mk")[["composite", "income_grade"]]
+        df = si_df.copy()
+        df["income_score"] = df["match_key"].map(grade_map["composite"])
+        df["income_grade"] = df["match_key"].map(grade_map["income_grade"])
+
+        # avg_price_per_pyeong 없는 행 → income_grade 강제 None
+        no_price = df["avg_price_per_pyeong"].isna() | (df["avg_price_per_pyeong"] == 0)
+        df.loc[no_price, "income_score"] = None
+        df.loc[no_price, "income_grade"] = None
 
         return df
 
@@ -300,7 +403,10 @@ class DataMerger:
 
         # 4. 결과 산출 + 아파트 평당가 보강
         results = {cd: calc_saturation_index(merge_with_population(pop_df, hosp_summary, cd), num_col, den_col) for cd in specialty_codes}
-        results = {cd: enrich_with_apt_price(df, analysis_level) for cd, df in results.items()}
+        results = {
+            cd: calc_income_index(enrich_with_apt_price(df, analysis_level), analysis_level)
+            for cd, df in results.items()
+        }
         return {"population": pop_df, "hospitals": hosp_mapped, "hospital_summary": hosp_summary,
                 "saturation": results, "analysis_level": analysis_level,
                 "sgg_codes": existing_sgg_codes}

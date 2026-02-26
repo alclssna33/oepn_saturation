@@ -168,7 +168,9 @@ def _load_data(sgg_cd_pop, hira_sido_cd, sgg_name, specialty_codes, year_month, 
         res["geojson_dissolved"] = json.loads(dissolved.to_json())
     return res
 
-def _make_choropleth(si_df: pd.DataFrame, geojson: dict) -> go.Figure:
+def _make_choropleth(si_df: pd.DataFrame, geojson: dict,
+                     hospital_markers: pd.DataFrame | None = None,
+                     selected_key: str = "") -> go.Figure:
     loc_col = "match_key" if "match_key" in si_df.columns else "admmCd"
     codes = set(si_df[loc_col].dropna().astype(str))
     gj_filtered = {"type": "FeatureCollection", "features": [f for f in geojson["features"] if f["properties"].get("adm_cd2") in codes]}
@@ -189,7 +191,7 @@ def _make_choropleth(si_df: pd.DataFrame, geojson: dict) -> go.Figure:
     df["_hover_pop"] = df["총인구수"].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "N/A") if "총인구수" in df.columns else "N/A"
     df["_hover_hh"]  = df["세대수"].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "N/A") if "세대수" in df.columns else "N/A"
 
-    has_price = "avg_price_per_pyeong" in df.columns
+    has_income = "income_grade" in df.columns
     custom_cols = ["행정동명", "_hover_si", "saturation_level", "clinic_count", "specialist_count", "_hover_pop", "_hover_hh"]
     hover_tmpl = (
         "<b>%{customdata[0]}</b><br>"
@@ -197,28 +199,62 @@ def _make_choropleth(si_df: pd.DataFrame, geojson: dict) -> go.Figure:
         "의원 수: %{customdata[3]}개&nbsp;&nbsp;전문의 수: %{customdata[4]}명<br>"
         "총 인구수: %{customdata[5]}명&nbsp;&nbsp;세대수: %{customdata[6]}세대"
     )
-    if has_price:
-        df["_hover_price"] = df["avg_price_per_pyeong"].apply(
-            lambda x: f"{int(x):,}만원/평" if pd.notna(x) and x > 0 else "정보없음"
+    if has_income:
+        df["_hover_income"] = df["income_grade"].apply(
+            lambda x: str(x) if pd.notna(x) and x else "미산출"
         )
-        custom_cols.append("_hover_price")
-        hover_tmpl += "<br>아파트 평당가: %{customdata[7]}"
+        custom_cols.append("_hover_income")
+        hover_tmpl += "<br>개비공 소득지수: %{customdata[7]}"
     hover_tmpl += "<extra></extra>"
 
-    fig = go.Figure(go.Choroplethmapbox(
-        geojson=gj_filtered, featureidkey="properties.adm_cd2",
-        locations=df[loc_col].astype(str), z=df["_z"],
-        colorscale=_DISCRETE_CS,
-        zmin=0, zmax=3,
-        colorbar=dict(
-            tickvals=[0.375, 1.125, 1.875, 2.625],
-            ticktext=["포화", "보통", "여유", "데이터없음"],
-            title="등급", thickness=14, len=0.5,
-        ),
-        marker_opacity=0.78, marker_line_width=1.2, marker_line_color="#FFFFFF",
-        customdata=df[custom_cols].values,
-        hovertemplate=hover_tmpl,
-    ))
+    _colorbar = dict(
+        tickvals=[0.375, 1.125, 1.875, 2.625],
+        ticktext=["포화", "보통", "여유", "데이터없음"],
+        title="등급", thickness=14, len=0.5,
+    )
+
+    if selected_key:
+        # 레이어 1: 전체 행정동 흐리게 (배경 — 클릭 가능)
+        fig = go.Figure(go.Choroplethmapbox(
+            geojson=gj_filtered, featureidkey="properties.adm_cd2",
+            locations=df[loc_col].astype(str), z=df["_z"],
+            colorscale=_DISCRETE_CS, zmin=0, zmax=3,
+            colorbar=_colorbar,
+            marker_opacity=0.2, marker_line_width=0.8, marker_line_color="#FFFFFF",
+            customdata=df[custom_cols].values,
+            hovertemplate=hover_tmpl,
+            showscale=False,
+        ))
+        # 레이어 2: 선택된 행정동만 선명하게 (위에 덧그림)
+        df_sel = df[df[loc_col].astype(str) == selected_key]
+        gj_sel = {
+            "type": "FeatureCollection",
+            "features": [f for f in gj_filtered["features"]
+                         if f["properties"].get("adm_cd2") == selected_key],
+        }
+        if not df_sel.empty:
+            fig.add_trace(go.Choroplethmapbox(
+                geojson=gj_sel, featureidkey="properties.adm_cd2",
+                locations=df_sel[loc_col].astype(str), z=df_sel["_z"],
+                colorscale=_DISCRETE_CS, zmin=0, zmax=3,
+                colorbar=_colorbar,
+                marker_opacity=0.88, marker_line_width=2.5, marker_line_color="#FFFFFF",
+                customdata=df_sel[custom_cols].values,
+                hovertemplate=hover_tmpl,
+                showscale=True,
+            ))
+    else:
+        # 선택 없음: 전체 행정동 일반 표시
+        fig = go.Figure(go.Choroplethmapbox(
+            geojson=gj_filtered, featureidkey="properties.adm_cd2",
+            locations=df[loc_col].astype(str), z=df["_z"],
+            colorscale=_DISCRETE_CS, zmin=0, zmax=3,
+            colorbar=_colorbar,
+            marker_opacity=0.78, marker_line_width=1.2, marker_line_color="#FFFFFF",
+            customdata=df[custom_cols].values,
+            hovertemplate=hover_tmpl,
+            showscale=True,
+        ))
 
     try:
         gdf_tmp = gpd.GeoDataFrame.from_features(gj_filtered["features"])
@@ -233,21 +269,41 @@ def _make_choropleth(si_df: pd.DataFrame, geojson: dict) -> go.Figure:
         height=530,
         clickmode="event+select",
     )
+
+    # 의원 위치 핀 (핀 모양)
+    if hospital_markers is not None and not hospital_markers.empty:
+        fig.add_trace(go.Scattermapbox(
+            lat=hospital_markers["YPos"].tolist(),
+            lon=hospital_markers["XPos"].tolist(),
+            mode="markers",
+            name="의원 위치",
+            marker=dict(size=16, color="#1D4ED8", opacity=0.95,
+                        allowoverlap=True),
+            customdata=hospital_markers[["yadmNm", "clCdNm", "addr"]].values,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "종별: %{customdata[1]}<br>"
+                "주소: %{customdata[2]}"
+                "<extra></extra>"
+            ),
+            showlegend=True,
+        ))
+
     return fig
 
 def _make_scatter_chart(si_df: pd.DataFrame) -> go.Figure:
-    """소득수준(아파트 평당가) × 포화도 지수 산점도. 우상단이 최적 입지."""
-    df = si_df.dropna(subset=["avg_price_per_pyeong", "SI_normalized"]).copy()
-    df = df[(df["saturation_level"] != "데이터없음") & (df["avg_price_per_pyeong"] > 0)]
+    """개비공 소득지수(0-100) × 포화도 지수 산점도. 우상단이 최적 입지."""
+    df = si_df.dropna(subset=["income_score", "SI_normalized"]).copy()
+    df = df[(df["saturation_level"] != "데이터없음") & (df["income_score"].notna())]
     if df.empty:
         return go.Figure()
 
-    df["_si_capped"]  = df["SI_normalized"].clip(upper=3.0)
-    df["_si_label"]   = df["SI_normalized"].apply(lambda x: "기회 최대(∞)" if x == 3.0 else f"{x:.2f}")
-    df["_price_label"] = df["avg_price_per_pyeong"].apply(lambda x: f"{int(x):,}")
+    df["_si_capped"]     = df["SI_normalized"].clip(upper=3.0)
+    df["_si_label"]      = df["SI_normalized"].apply(lambda x: "기회 최대(∞)" if x == 3.0 else f"{x:.2f}")
+    df["_income_label"]  = df["income_score"].apply(lambda x: f"{x:.1f}")
+    df["_grade_label"]   = df["income_grade"].fillna("미산출")
     name_col = "행정동명" if "행정동명" in df.columns else "시군구명"
 
-    med_price = int(df["avg_price_per_pyeong"].median())
     fig = go.Figure()
 
     for level, color in LEVEL_COLOR.items():
@@ -257,16 +313,16 @@ def _make_scatter_chart(si_df: pd.DataFrame) -> go.Figure:
         if sub.empty:
             continue
         fig.add_trace(go.Scatter(
-            x=sub["avg_price_per_pyeong"],
+            x=sub["income_score"],
             y=sub["_si_capped"],
             mode="markers",
             name=level,
-            marker=dict(color=color, size=8, opacity=0.75,
-                        line=dict(width=0.5, color="white")),
-            customdata=sub[[name_col, "_si_label", "clinic_count", "_price_label"]].values,
+            marker=dict(color=color, size=12, opacity=0.75,
+                        line=dict(width=0.8, color="white")),
+            customdata=sub[[name_col, "_si_label", "clinic_count", "_income_label", "_grade_label"]].values,
             hovertemplate=(
                 "<b>%{customdata[0]}</b><br>"
-                "평당가: %{customdata[3]}만원/평<br>"
+                "소득지수: %{customdata[4]}등급 (%{customdata[3]}점)<br>"
                 "포화도: %{customdata[1]}<br>"
                 "의원 수: %{customdata[2]}개"
                 "<extra></extra>"
@@ -277,19 +333,17 @@ def _make_scatter_chart(si_df: pd.DataFrame) -> go.Figure:
     fig.add_hline(y=1.0, line_dash="dot", line_color="#374151", line_width=1.5,
                   annotation_text="포화도 평균(1.0)", annotation_position="top right",
                   annotation_font_size=11)
-    fig.add_vline(x=med_price, line_dash="dot", line_color="#374151", line_width=1.5,
-                  annotation_text=f"중위 평당가({med_price:,}만원)", annotation_position="top right",
+    fig.add_vline(x=50.0, line_dash="dot", line_color="#374151", line_width=1.5,
+                  annotation_text="전국 중위(50점)", annotation_position="top right",
                   annotation_font_size=11)
 
     # 사분면 레이블
-    x_max = df["avg_price_per_pyeong"].quantile(0.97)
-    x_min = df["avg_price_per_pyeong"].quantile(0.03)
     y_max = min(df["_si_capped"].max() * 1.05, 3.2)
     for ann_x, ann_y, text, color in [
-        (x_max, y_max,  "최적 입지\n(고소득·여유)", "#16A34A"),
-        (x_min, y_max,  "기회 지역\n(저소득·여유)", "#D97706"),
-        (x_max, 0.25,   "주의\n(고소득·포화)",  "#DC2626"),
-        (x_min, 0.25,   "불리\n(저소득·포화)",  "#9CA3AF"),
+        (95.0, y_max,  "최적 입지\n(고소득·여유)", "#16A34A"),
+        (5.0,  y_max,  "기회 지역\n(저소득·여유)", "#D97706"),
+        (95.0, 0.25,   "주의\n(고소득·포화)",       "#DC2626"),
+        (5.0,  0.25,   "불리\n(저소득·포화)",        "#9CA3AF"),
     ]:
         fig.add_annotation(
             x=ann_x, y=ann_y, text=text.replace("\n", "<br>"),
@@ -303,7 +357,8 @@ def _make_scatter_chart(si_df: pd.DataFrame) -> go.Figure:
         plot_bgcolor="white",
         margin=dict(r=20, t=20, l=20, b=20),
         legend=dict(orientation="h", y=1.08, x=0),
-        xaxis=dict(title="아파트 평당가 (만원/평)", showgrid=True, gridcolor="#F3F4F6"),
+        xaxis=dict(title="← 저소득 | 개비공 소득점수 (0-100) | 고소득 →",
+                   range=[-2, 102], showgrid=True, gridcolor="#F3F4F6"),
         yaxis=dict(title="포화도 지수", showgrid=True, gridcolor="#F3F4F6"),
     )
     return fig
@@ -533,8 +588,35 @@ if "results" in st.session_state:
 
             with col_map:
                 st.markdown('<p class="chart-title">📍 행정동별 포화도 지도 — 클릭하면 의원 목록 표시</p>', unsafe_allow_html=True)
+
+                # 현재 선택된 행정동 (토글/핀 여부와 무관하게 항상 읽음)
+                current_sel = st.session_state.get(sel_key, "")
+
+                # 의원 위치 핀 토글 (dong 분석 전용)
+                show_markers = False
+                if analysis_level == "dong":
+                    show_markers = st.toggle(
+                        "📌 의원 위치 핀 표시",
+                        key=f"show_markers_{sp_nm}",
+                        help="행정동을 클릭한 후 해당 동의 의원 위치를 지도에 표시합니다.",
+                    )
+
+                # 마커 데이터 준비 (토글 ON + 행정동 선택 시)
+                markers_df = None
+                if show_markers and current_sel and not hosp_df.empty:
+                    _mdf = hosp_df[
+                        (hosp_df["match_key"].astype(str) == current_sel) &
+                        (hosp_df["specialty_cd"] == sp_cd) &
+                        (hosp_df["XPos"].notna()) & (hosp_df["XPos"] != 0) &
+                        (hosp_df["YPos"].notna()) & (hosp_df["YPos"] != 0)
+                    ].copy()
+                    if not _mdf.empty:
+                        markers_df = _mdf
+
                 map_event = st.plotly_chart(
-                    _make_choropleth(si_df, geojson),
+                    _make_choropleth(si_df, geojson,
+                                     hospital_markers=markers_df,
+                                     selected_key=current_sel),
                     use_container_width=True,
                     on_select="rerun",
                     key=f"map_{sp_nm}",
@@ -545,12 +627,12 @@ if "results" in st.session_state:
                         "modeBarButtonsToRemove": ["toImage", "lasso2d", "select2d"],
                     },
                 )
-                # 선택된 지역 session_state 저장
+                # 선택된 지역 session_state 저장 (Scattermapbox 클릭 시 선택 해제 방지)
                 if (map_event and hasattr(map_event, "selection")
                         and map_event.selection.points):
-                    st.session_state[sel_key] = str(
-                        map_event.selection.points[0].get("location", "")
-                    )
+                    _loc = str(map_event.selection.points[0].get("location", ""))
+                    if _loc:  # Choroplethmapbox 폴리곤 클릭만 처리
+                        st.session_state[sel_key] = _loc
 
             with col_bar:
                 st.markdown('<p class="chart-title">📊 포화도 순위 — 위로 갈수록 기회 많음</p>', unsafe_allow_html=True)
@@ -561,12 +643,12 @@ if "results" in st.session_state:
                 )
 
             # ── 소득 × 포화도 산점도 ──────────────────────────────────
-            has_price_col = ("avg_price_per_pyeong" in si_df.columns
-                             and si_df["avg_price_per_pyeong"].notna().any())
-            if has_price_col:
+            has_income_col = ("income_score" in si_df.columns
+                              and si_df["income_score"].notna().any())
+            if has_income_col:
                 st.markdown("---")
                 st.markdown(
-                    '<p class="chart-title">💰 소득수준(아파트 평당가) × 포화도 입지 분석 '
+                    '<p class="chart-title">📊 개비공 소득지수 × 포화도 입지 분석 '
                     '— 우상단이 최적 입지 (고소득·여유)</p>',
                     unsafe_allow_html=True,
                 )
@@ -606,11 +688,11 @@ if "results" in st.session_state:
                         st.session_state.pop(sel_key, None)
                         st.rerun()
 
-                price_val = None
-                if not dong_row.empty and "avg_price_per_pyeong" in dong_row.columns:
-                    _pv = dong_row["avg_price_per_pyeong"].values[0]
-                    if pd.notna(_pv) and _pv > 0:
-                        price_val = int(_pv)
+                income_grade_val = None
+                if not dong_row.empty and "income_grade" in dong_row.columns:
+                    _ig = dong_row["income_grade"].values[0]
+                    if pd.notna(_ig) and _ig:
+                        income_grade_val = str(_ig)
 
                 dm1, dm2, dm3, dm4, dm5, dm6 = st.columns(6)
                 dm1.metric(f"{sp_nm} 의원 수", f"{n_clinic}개")
@@ -620,8 +702,19 @@ if "results" in st.session_state:
                 dm3.metric("포화도 지수", si_label)
                 dm4.metric("총 인구수", f"{n_pop:,}명")
                 dm5.metric("세대수", f"{n_hh:,}세대")
-                if price_val:
-                    dm6.metric("아파트 평당가", f"{price_val:,}만원/평")
+                _GRADE_COLOR = {
+                    "S": "#7C3AED", "A": "#2563EB",
+                    "B": "#16A34A", "C": "#D97706", "D": "#9CA3AF",
+                }
+                if income_grade_val:
+                    gc = _GRADE_COLOR.get(income_grade_val, "#9CA3AF")
+                    dm6.markdown(
+                        f"<div style='font-size:12px;color:#6B7280;margin-bottom:4px'>"
+                        f"개비공 소득지수</div>"
+                        f"<span style='font-size:28px;font-weight:700;color:{gc}'>"
+                        f"{income_grade_val}</span>",
+                        unsafe_allow_html=True,
+                    )
 
                 if not hosp_df.empty and "match_key" in hosp_df.columns and "specialty_cd" in hosp_df.columns:
                     clinics = hosp_df[

@@ -167,6 +167,38 @@
   - **[해결책] GeoJSON dissolve_key 동적 계산** (`app.py`):
     - 기존 단순 `str[:5]` 슬라이싱 → `existing_sgg_codes` 기반 동적 판별로 교체, 구 폴리곤을 parent city 폴리곤으로 정확히 병합.
 
+- [x] **22단계 (완료):** 개비공 소득지수 도입 (아파트 평당가 기반 복합 지표)
+  - **배경**: 아파트 평당가를 단순 수치로 표시하는 대신, '개비공만의 행정동 소득수준 지표'로 가공하여 직관적인 등급 비교 가능하게 함.
+  - **지표 설계**: 아파트 평당가(70%) + 30~59세 인구비율(30%) 복합 → log2 로그 변환 후 전국 기준 분위수 → S/A/B/C/D 5등급.
+  - **`modules/data_merge.py` — `calc_income_index()` 함수 신규 추가**:
+    - `import numpy as np` 추가.
+    - `avg_price_per_pyeong`의 log2 로그 정규화 → 전국 min-max 스케일링(평당가 고왜도 분포 보정).
+    - `population_age` 테이블에서 30~59세 비율 산출 후 전국 min-max 스케일링.
+    - 복합 점수(`composite = price_score×0.7 + active_score×0.3`) 전국 quintile로 5등급 분류: S(80%↑) / A(60~80%) / B(40~60%) / C(20~40%) / D(0~20%).
+    - 아파트 데이터 없는 지역은 `income_grade=None` (UI에서 회색 미산출 표시).
+    - `DataMerger.run()`에서 `enrich_with_apt_price()` 직후 자동 체이닝 호출.
+  - **`app.py` UI 연동**:
+    - 지도 hover tooltip에 "개비공 소득지수: S/A/B/C/D" 조건부 표시.
+    - `_make_scatter_chart()` X축: 평당가(수치) → `income_score`(0-100점)로 교체, 레이블 "← 저소득 | 개비공 소득점수 (0-100) | 고소득 →", 중간선 X=50.
+    - 행정동 클릭 요약 카드 6번째 지표: 소득지수 등급 컬러 배지 (S=보라`#7C3AED` / A=파랑`#2563EB` / B=초록`#16A34A` / C=주황`#D97706` / D=회색`#9CA3AF`).
+    - 산점도 마커 크기 확대: `size=8 → 12`, `line_width=0.5 → 0.8`.
+  - **검증**: 전국 3,925개 지역에 S/A/B/C/D 각 785개씩 균등 분포 확인.
+
+- [x] **23단계 (완료):** 의원 위치 핀 표시 기능 추가
+  - **기능**: 행정동 분석 지도에서 특정 행정동 클릭 시, 해당 동 내 의원 위치를 파랑 원형 마커(`#1D4ED8`)로 오버레이 표시.
+  - **토글 조건**: `analysis_level == "dong"` (특정 시군구 선정 상태)에서만 "📌 의원 위치 핀 표시" 토글 버튼 노출. sido/national 레벨에서는 토글 미표시.
+  - **표시 조건**: 토글 ON + 행정동 선택 완료 + XPos/YPos 유효값 보유 의원만 표시.
+  - **`_make_choropleth()` 변경사항** (`app.py`):
+    - `hospital_markers: pd.DataFrame | None = None` 파라미터 추가 → `go.Scattermapbox` 트레이스 레이어로 의원 마커 오버레이.
+    - `selected_key: str = ""` 파라미터 추가 → 이중 Choroplethmapbox 레이어 구현.
+    - 이중 레이어: ① 전체 행정동 흐림(opacity=0.2, 클릭 가능 유지) + ② 선택된 행정동 강조(opacity=0.88, line_width=2.5).
+    - 행정동 미선택 상태: 단일 레이어(opacity=0.78) 정상 표시.
+  - **버그 수정 3건**:
+    1. **`Scattermapbox marker.line` 미지원**: `go.Scattermapbox` Marker에 `line` 속성 없음 → ValueError 발생. 해결: `line=dict(...)` 제거.
+    2. **`symbol="marker"` 렌더링 실패**: Maki 아이콘은 Mapbox 토큰 없이 carto-positron 스타일에서 렌더링 불가 → 트레이스 전체 무표시. 해결: `symbol` 파라미터 제거, 기본 circle 사용.
+    3. **Scattermapbox 클릭 시 행정동 선택 해제**: 마커 클릭 시 `"location"` 키 없어 `""` 반환 → sel_key 초기화 → 클릭 패널 닫힘. 해결: `if _loc:` 가드 추가.
+  - **마커 디자인**: 파랑 원형(`#1D4ED8`, size=16, opacity=0.95). choropleth 4색(빨강/주황/초록/회색)과 색상 대비 확보. hover: 의원명 + 종별 + 주소.
+
 ---
 
 ### 5. 현재 파일 구조
@@ -259,6 +291,10 @@
 | sido 분석에서 수원시·고양시·용인시 등이 구 단위로 분리 표시 | `get_sgg_list`가 시·구 레벨을 모두 반환 → 각 구마다 별도 match_key 생성 | `existing_sgg_codes` 집합 빌드 후 `city_5 in sgg_codes` 체크로 구→시 통합; 인구 합산 처리 추가 |
 | 부천시 sido 분석 시 의원 0개 표시 | 구폐지(2016) 후 population DB는 구 코드(41192 등) 유지, GeoJSON은 통합 코드(41190) 사용 → match_key 불일치 | `existing_sgg_codes` 체크 동일 로직으로 4119x → 41190 통합 처리 |
 | sido dissolve 후 구 경계가 별도 폴리곤으로 남음 | `dissolve_key = gdf["adm_cd2"].str[:5]` 단순 슬라이싱이 구 코드(41111 등)를 그대로 사용 | `app.py`의 dissolve_key 계산을 `existing_sgg_codes` 기반 동적 판별로 교체 |
+| `ValueError: Invalid property ... scattermapbox.Marker: 'line'` | `go.Scattermapbox` Marker는 `line` 속성을 지원하지 않음 (Scattermap과 다름) | `line=dict(width=..., color=...)` 제거 |
+| Scattermapbox 마커가 지도에 표시 안 됨 | `symbol="marker"` (Maki 아이콘)은 Mapbox 공개 토큰 없이 carto-positron 스타일에서 렌더링 불가 → 트레이스 전체 무시됨 | `symbol` 파라미터 제거, 기본 circle 사용 |
+| 의원 마커 클릭 시 행정동 선택 패널이 닫힘 | `selection.points[0].get("location", "")` → Scattermapbox 마커 클릭 시 `"location"` 키 없어 `""` 반환 → sel_key 초기화 | 클릭 핸들러에 `if _loc:` 가드 추가 (빈 문자열이면 sel_key 갱신 안 함) |
+| 의원 핀이 포화 지역(빨강)에서 안 보임 | choropleth 4색 중 하나(빨강 `#DC2626`)와 동일한 색으로 마커 지정 | choropleth 4색(빨강/주황/초록/회색)과 대비되는 짙은 파랑(`#1D4ED8`)으로 변경 |
 
 ---
 
@@ -305,9 +341,9 @@
 
 ---
 
-### 10. 아파트 실거래가(소득 대리 지표) 데이터 파이프라인 ✅ 구현 완료
+### 10. 아파트 실거래가 + 개비공 소득지수 데이터 파이프라인 ✅ 구현 완료
 
-> **행정동 단위 소득 실데이터 부재에 따른 대안 구축 방안 — 21단계에서 구현 완료**
+> **행정동 단위 소득 실데이터 부재에 따른 대안 구축 방안 — 21단계(평당가 파이프라인) + 22단계(소득지수 가공)에서 구현 완료**
 
 - **배경**: 전국의 행정동 단위 평균 소득 데이터는 무료 공공데이터로 전체 공개되지 않음.
 - **해결책**: 국토교통부 아파트 매매 실거래가를 수집하여 **법정동별 아파트 평당 평균 거래가**를 소득 대리 지표로 활용.
@@ -359,17 +395,34 @@
 | `base_ym_from` | TEXT | 데이터 시작 년월 (예: "202501") |
 | `base_ym_to` | TEXT | 데이터 종료 년월 (예: "202602") |
 
-#### 산점도 읽는 법 (소득 × 포화도 입지 분석)
+#### 개비공 소득지수 계산 흐름 (22단계 추가)
 
 ```
-y축(포화도 ↑) × x축(평당가 ↑)
+[apt_price_bjd] avg_price_per_pyeong (법정동 평균 평당가)
+      + [population_age] 30~59세 인구비율
+      ↓ calc_income_index() — data_merge.py
+  log2(평당가) → 전국 min-max → price_score (0~100)
+  30~59세비율  → 전국 min-max → active_score (0~100)
+  composite = price_score×0.7 + active_score×0.3
+  전국 quintile → S(80%↑) / A(60%) / B(40%) / C(20%) / D(0%)
+      ↓ si_df에 income_score, income_grade 컬럼 추가
+[app.py]
+  지도 hover: "개비공 소득지수: A"
+  클릭 패널 6번째 지표: 등급 컬러 배지
+  산점도 X축: income_score (0~100점)
+```
+
+#### 산점도 읽는 법 (개비공 소득지수 × 포화도 입지 분석)
+
+```
+y축(포화도 ↑) × x축(개비공 소득점수 ↑, 0-100)
 
 [기회 지역]     │   [최적 입지 ★]
  저소득 · 여유  │   고소득 · 여유
 ────────────────┼────────────────  ← SI = 1.0 (전국 평균)
    [불리]       │     [주의]
  저소득 · 포화  │   고소득 · 포화
-                ↑ 중위 평당가
+                ↑ 소득점수 50점
 ```
 
 #### 정기 업데이트 방법 (연 1회 권장)
