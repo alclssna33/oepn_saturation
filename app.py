@@ -189,6 +189,22 @@ def _make_choropleth(si_df: pd.DataFrame, geojson: dict) -> go.Figure:
     df["_hover_pop"] = df["총인구수"].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "N/A") if "총인구수" in df.columns else "N/A"
     df["_hover_hh"]  = df["세대수"].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "N/A") if "세대수" in df.columns else "N/A"
 
+    has_price = "avg_price_per_pyeong" in df.columns
+    custom_cols = ["행정동명", "_hover_si", "saturation_level", "clinic_count", "specialist_count", "_hover_pop", "_hover_hh"]
+    hover_tmpl = (
+        "<b>%{customdata[0]}</b><br>"
+        "포화도 지수: %{customdata[1]}&nbsp;&nbsp;등급: %{customdata[2]}<br>"
+        "의원 수: %{customdata[3]}개&nbsp;&nbsp;전문의 수: %{customdata[4]}명<br>"
+        "총 인구수: %{customdata[5]}명&nbsp;&nbsp;세대수: %{customdata[6]}세대"
+    )
+    if has_price:
+        df["_hover_price"] = df["avg_price_per_pyeong"].apply(
+            lambda x: f"{int(x):,}만원/평" if pd.notna(x) and x > 0 else "정보없음"
+        )
+        custom_cols.append("_hover_price")
+        hover_tmpl += "<br>아파트 평당가: %{customdata[7]}"
+    hover_tmpl += "<extra></extra>"
+
     fig = go.Figure(go.Choroplethmapbox(
         geojson=gj_filtered, featureidkey="properties.adm_cd2",
         locations=df[loc_col].astype(str), z=df["_z"],
@@ -200,14 +216,8 @@ def _make_choropleth(si_df: pd.DataFrame, geojson: dict) -> go.Figure:
             title="등급", thickness=14, len=0.5,
         ),
         marker_opacity=0.78, marker_line_width=1.2, marker_line_color="#FFFFFF",
-        customdata=df[["행정동명", "_hover_si", "saturation_level", "clinic_count", "specialist_count", "_hover_pop", "_hover_hh"]].values,
-        hovertemplate=(
-            "<b>%{customdata[0]}</b><br>"
-            "포화도 지수: %{customdata[1]}&nbsp;&nbsp;등급: %{customdata[2]}<br>"
-            "의원 수: %{customdata[3]}개&nbsp;&nbsp;전문의 수: %{customdata[4]}명<br>"
-            "총 인구수: %{customdata[5]}명&nbsp;&nbsp;세대수: %{customdata[6]}세대"
-            "<extra></extra>"
-        ),
+        customdata=df[custom_cols].values,
+        hovertemplate=hover_tmpl,
     ))
 
     try:
@@ -224,6 +234,80 @@ def _make_choropleth(si_df: pd.DataFrame, geojson: dict) -> go.Figure:
         clickmode="event+select",
     )
     return fig
+
+def _make_scatter_chart(si_df: pd.DataFrame) -> go.Figure:
+    """소득수준(아파트 평당가) × 포화도 지수 산점도. 우상단이 최적 입지."""
+    df = si_df.dropna(subset=["avg_price_per_pyeong", "SI_normalized"]).copy()
+    df = df[(df["saturation_level"] != "데이터없음") & (df["avg_price_per_pyeong"] > 0)]
+    if df.empty:
+        return go.Figure()
+
+    df["_si_capped"]  = df["SI_normalized"].clip(upper=3.0)
+    df["_si_label"]   = df["SI_normalized"].apply(lambda x: "기회 최대(∞)" if x == 3.0 else f"{x:.2f}")
+    df["_price_label"] = df["avg_price_per_pyeong"].apply(lambda x: f"{int(x):,}")
+    name_col = "행정동명" if "행정동명" in df.columns else "시군구명"
+
+    med_price = int(df["avg_price_per_pyeong"].median())
+    fig = go.Figure()
+
+    for level, color in LEVEL_COLOR.items():
+        if level == "데이터없음":
+            continue
+        sub = df[df["saturation_level"] == level]
+        if sub.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=sub["avg_price_per_pyeong"],
+            y=sub["_si_capped"],
+            mode="markers",
+            name=level,
+            marker=dict(color=color, size=8, opacity=0.75,
+                        line=dict(width=0.5, color="white")),
+            customdata=sub[[name_col, "_si_label", "clinic_count", "_price_label"]].values,
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "평당가: %{customdata[3]}만원/평<br>"
+                "포화도: %{customdata[1]}<br>"
+                "의원 수: %{customdata[2]}개"
+                "<extra></extra>"
+            ),
+        ))
+
+    # 기준선
+    fig.add_hline(y=1.0, line_dash="dot", line_color="#374151", line_width=1.5,
+                  annotation_text="포화도 평균(1.0)", annotation_position="top right",
+                  annotation_font_size=11)
+    fig.add_vline(x=med_price, line_dash="dot", line_color="#374151", line_width=1.5,
+                  annotation_text=f"중위 평당가({med_price:,}만원)", annotation_position="top right",
+                  annotation_font_size=11)
+
+    # 사분면 레이블
+    x_max = df["avg_price_per_pyeong"].quantile(0.97)
+    x_min = df["avg_price_per_pyeong"].quantile(0.03)
+    y_max = min(df["_si_capped"].max() * 1.05, 3.2)
+    for ann_x, ann_y, text, color in [
+        (x_max, y_max,  "최적 입지\n(고소득·여유)", "#16A34A"),
+        (x_min, y_max,  "기회 지역\n(저소득·여유)", "#D97706"),
+        (x_max, 0.25,   "주의\n(고소득·포화)",  "#DC2626"),
+        (x_min, 0.25,   "불리\n(저소득·포화)",  "#9CA3AF"),
+    ]:
+        fig.add_annotation(
+            x=ann_x, y=ann_y, text=text.replace("\n", "<br>"),
+            showarrow=False, font=dict(color=color, size=10),
+            align="center", bgcolor="rgba(255,255,255,0.7)",
+            bordercolor=color, borderwidth=1, borderpad=4,
+        )
+
+    fig.update_layout(
+        height=420,
+        plot_bgcolor="white",
+        margin=dict(r=20, t=20, l=20, b=20),
+        legend=dict(orientation="h", y=1.08, x=0),
+        xaxis=dict(title="아파트 평당가 (만원/평)", showgrid=True, gridcolor="#F3F4F6"),
+        yaxis=dict(title="포화도 지수", showgrid=True, gridcolor="#F3F4F6"),
+    )
+    return fig
+
 
 def _make_bar_chart(si_df: pd.DataFrame, si_col: str = "SI_normalized") -> go.Figure:
     df = si_df.dropna(subset=[si_col]).copy()
@@ -476,6 +560,22 @@ if "results" in st.session_state:
                     key=f"bar_{sp_nm}",
                 )
 
+            # ── 소득 × 포화도 산점도 ──────────────────────────────────
+            has_price_col = ("avg_price_per_pyeong" in si_df.columns
+                             and si_df["avg_price_per_pyeong"].notna().any())
+            if has_price_col:
+                st.markdown("---")
+                st.markdown(
+                    '<p class="chart-title">💰 소득수준(아파트 평당가) × 포화도 입지 분석 '
+                    '— 우상단이 최적 입지 (고소득·여유)</p>',
+                    unsafe_allow_html=True,
+                )
+                st.plotly_chart(
+                    _make_scatter_chart(si_df),
+                    use_container_width=True,
+                    key=f"scatter_{sp_nm}",
+                )
+
             # ── 클릭된 행정동 의원 목록 ───────────────────────────────
             selected_key = st.session_state.get(sel_key, "")
             if selected_key:
@@ -506,7 +606,13 @@ if "results" in st.session_state:
                         st.session_state.pop(sel_key, None)
                         st.rerun()
 
-                dm1, dm2, dm3, dm4, dm5 = st.columns(5)
+                price_val = None
+                if not dong_row.empty and "avg_price_per_pyeong" in dong_row.columns:
+                    _pv = dong_row["avg_price_per_pyeong"].values[0]
+                    if pd.notna(_pv) and _pv > 0:
+                        price_val = int(_pv)
+
+                dm1, dm2, dm3, dm4, dm5, dm6 = st.columns(6)
                 dm1.metric(f"{sp_nm} 의원 수", f"{n_clinic}개")
                 dm2.metric("전문의 수", f"{n_spec}명")
                 si_label = ("기회 최대" if (n_clinic == 0 or si_val == 3.0)
@@ -514,6 +620,8 @@ if "results" in st.session_state:
                 dm3.metric("포화도 지수", si_label)
                 dm4.metric("총 인구수", f"{n_pop:,}명")
                 dm5.metric("세대수", f"{n_hh:,}세대")
+                if price_val:
+                    dm6.metric("아파트 평당가", f"{price_val:,}만원/평")
 
                 if not hosp_df.empty and "match_key" in hosp_df.columns and "specialty_cd" in hosp_df.columns:
                     clinics = hosp_df[

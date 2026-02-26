@@ -3,6 +3,7 @@
 """
 
 import os
+import sqlite3
 import warnings
 import json
 from pathlib import Path
@@ -16,6 +17,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 _NATIONAL_GEOJSON = Path(__file__).parent.parent / "data" / "geojson" / "national_dong.geojson"
 _SEOUL_GEOJSON    = Path(__file__).parent.parent / "data" / "geojson" / "seoul_dong.geojson"
 _DEFAULT_GEOJSON  = _NATIONAL_GEOJSON if _NATIONAL_GEOJSON.exists() else _SEOUL_GEOJSON
+_DB_PATH          = Path(__file__).parent.parent / "data" / "saturation.db"
 
 def _get_hira_to_pop_map():
     from modules.hospital_api import HIRA_SGG_MAP
@@ -34,6 +36,83 @@ def _safe_val(row, col):
     if hasattr(val, "__iter__") and not isinstance(val, (str, bytes)):
         return val.iloc[0] if hasattr(val, "iloc") else val[0]
     return val
+
+# ── 아파트 평당가 보강 ─────────────────────────────────────────────────────────
+def enrich_with_apt_price(si_df: pd.DataFrame, analysis_level: str) -> pd.DataFrame:
+    """
+    si_df에 avg_price_per_pyeong (아파트 평당가, 만원/평) 컬럼을 추가.
+    apt_price_bjd 테이블이 없거나 오류 발생 시 원본 DataFrame 그대로 반환.
+
+    조인 체인:
+      dong    : si_df.match_key(10자리 hjd_cd) → region_code_mapping.hjd_cd → bjd_cd → apt_price_bjd
+      sido    : si_df.match_key(5자리 sgg)      → hjd_cd[:5] 기준 평균
+      national: si_df.match_key(2자리 sido)     → hjd_cd[:2] 기준 평균
+    """
+    try:
+        conn = sqlite3.connect(_DB_PATH)
+        # apt_price_bjd 테이블 존재 여부 확인
+        tbl = pd.read_sql_query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='apt_price_bjd'",
+            conn,
+        )
+        if tbl.empty:
+            conn.close()
+            return si_df
+
+        # hjd_cd별 거래량 가중 평균 평당가 계산
+        # (hjd_cd 1개가 여러 bjd_cd에 속하므로 거래건수 가중 평균 사용)
+        price_map = pd.read_sql_query(
+            """
+            SELECT r.hjd_cd,
+                   CAST(
+                       SUM(a.avg_price_per_pyeong * a.trade_count) * 1.0
+                       / SUM(a.trade_count)
+                   AS INTEGER) AS avg_price_per_pyeong
+            FROM region_code_mapping r
+            JOIN apt_price_bjd a ON r.bjd_cd = a.bjd_cd
+            WHERE r.hjd_cd IS NOT NULL AND LENGTH(r.hjd_cd) = 10
+            GROUP BY r.hjd_cd
+            """,
+            conn,
+        )
+        conn.close()
+
+        price_map["hjd_cd"] = price_map["hjd_cd"].astype(str)
+        df = si_df.copy()
+
+        if analysis_level == "dong":
+            merge_df = price_map.rename(columns={"hjd_cd": "match_key"})
+            df = df.merge(merge_df, on="match_key", how="left")
+
+        elif analysis_level == "sido":
+            # match_key = 5자리 sgg 코드 → hjd_cd 앞 5자리로 집계
+            price_map["mk5"] = price_map["hjd_cd"].str[:5]
+            sgg_agg = (
+                price_map.groupby("mk5", as_index=False)["avg_price_per_pyeong"]
+                .mean()
+                .round(0)
+            )
+            sgg_agg["avg_price_per_pyeong"] = sgg_agg["avg_price_per_pyeong"].astype(int)
+            sgg_agg = sgg_agg.rename(columns={"mk5": "match_key"})
+            df = df.merge(sgg_agg, on="match_key", how="left")
+
+        elif analysis_level == "national":
+            # match_key = 2자리 sido 코드 → hjd_cd 앞 2자리로 집계
+            price_map["mk2"] = price_map["hjd_cd"].str[:2]
+            sido_agg = (
+                price_map.groupby("mk2", as_index=False)["avg_price_per_pyeong"]
+                .mean()
+                .round(0)
+            )
+            sido_agg["avg_price_per_pyeong"] = sido_agg["avg_price_per_pyeong"].astype(int)
+            sido_agg = sido_agg.rename(columns={"mk2": "match_key"})
+            df = df.merge(sido_agg, on="match_key", how="left")
+
+        return df
+
+    except Exception:
+        return si_df
+
 
 # ── 병합 및 지수 산출 함수 ──────────────────────────────────────────────────────
 def merge_with_population(pop_df: pd.DataFrame, hospital_summary: pd.DataFrame, specialty_cd: str) -> pd.DataFrame:
@@ -219,8 +298,9 @@ class DataMerger:
             clinic_count=("ykiho", "count"), specialist_count=("mdeptSdrCnt", "sum")
         )
 
-        # 4. 결과 산출
+        # 4. 결과 산출 + 아파트 평당가 보강
         results = {cd: calc_saturation_index(merge_with_population(pop_df, hosp_summary, cd), num_col, den_col) for cd in specialty_codes}
+        results = {cd: enrich_with_apt_price(df, analysis_level) for cd, df in results.items()}
         return {"population": pop_df, "hospitals": hosp_mapped, "hospital_summary": hosp_summary,
                 "saturation": results, "analysis_level": analysis_level,
                 "sgg_codes": existing_sgg_codes}
