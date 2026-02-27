@@ -184,6 +184,20 @@
     - 산점도 마커 크기 확대: `size=8 → 12`, `line_width=0.5 → 0.8`.
   - **검증**: 전국 3,925개 지역에 S/A/B/C/D 각 785개씩 균등 분포 확인.
 
+- [x] **24단계 (완료):** Supabase 온라인 DB 배포 및 Streamlit Cloud 호스팅
+  - **Supabase 프로젝트 구축**: supabase.com에 신규 프로젝트 생성. SQL Editor에서 6개 테이블 DDL 실행(`population_age`, `population_house`, `region_code_mapping`, `hospital_info`, `hospital_specialty`, `apt_price_bjd`).
+  - **데이터 이관**: `scripts/migrate_to_supabase.py` (psycopg2 bulk INSERT 방식) 실행으로 545,059건 전량 이관 완료.
+  - **코드 DB 추상화 (`_get_conn()` 패턴)**:
+    - `config.py`: `SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "")` 추가.
+    - `modules/population_api.py`, `modules/hospital_api.py`, `modules/data_merge.py`: `_get_conn()` 함수에 psycopg2 분기 추가. `.env`의 `SUPABASE_DB_URL` 유무로 SQLite ↔ Supabase 자동 전환.
+    - `modules/hospital_api.py`: `_ph()` 헬퍼 추가(SQLite=`?` / PostgreSQL=`%s`), SELECT 별칭 쌍따옴표 처리.
+    - `modules/data_merge.py`: `sqlite_master` 테이블 존재 확인 쿼리를 `try/except` 방식으로 교체(PostgreSQL 비호환 해결).
+  - **[버그] PostgreSQL 컬럼명 소문자 변환**: PostgreSQL은 unquoted alias를 소문자로 폴드하여 `mdeptSdrCnt` → `mdeptsdrCnt` 변환 → `KeyError` 발생. SELECT 별칭 전체를 쌍따옴표로 감싸서 해결(`as "mdeptSdrCnt"`).
+  - **[버그] SSL 연결 오류**: Streamlit Cloud에서 `psycopg2.OperationalError` 발생. `SUPABASE_DB_URL` 끝에 `?sslmode=require` 추가로 해결.
+  - **GitHub 저장소 연동**: `https://github.com/alclssna33/oepn_saturation` 에 코드 Push. Streamlit Cloud에서 해당 저장소 연결 후 배포. Streamlit Secrets에 `SUPABASE_DB_URL`, `PUBLIC_DATA_API_KEY`, `ADMIN_PASSWORD` 설정.
+  - **`DB_data/supabase_schema.md` 업데이트**: `apt_price_bjd` 테이블 DDL 및 인덱스 추가.
+  - **`requirements.txt`**: `psycopg2-binary>=2.9.0` 추가.
+
 - [x] **23단계 (완료):** 의원 위치 핀 표시 기능 추가
   - **기능**: 행정동 분석 지도에서 특정 행정동 클릭 시, 해당 동 내 의원 위치를 파랑 원형 마커(`#1D4ED8`)로 오버레이 표시.
   - **토글 조건**: `analysis_level == "dong"` (특정 시군구 선정 상태)에서만 "📌 의원 위치 핀 표시" 토글 버튼 노출. sido/national 레벨에서는 토글 미표시.
@@ -295,6 +309,8 @@
 | Scattermapbox 마커가 지도에 표시 안 됨 | `symbol="marker"` (Maki 아이콘)은 Mapbox 공개 토큰 없이 carto-positron 스타일에서 렌더링 불가 → 트레이스 전체 무시됨 | `symbol` 파라미터 제거, 기본 circle 사용 |
 | 의원 마커 클릭 시 행정동 선택 패널이 닫힘 | `selection.points[0].get("location", "")` → Scattermapbox 마커 클릭 시 `"location"` 키 없어 `""` 반환 → sel_key 초기화 | 클릭 핸들러에 `if _loc:` 가드 추가 (빈 문자열이면 sel_key 갱신 안 함) |
 | 의원 핀이 포화 지역(빨강)에서 안 보임 | choropleth 4색 중 하나(빨강 `#DC2626`)와 동일한 색으로 마커 지정 | choropleth 4색(빨강/주황/초록/회색)과 대비되는 짙은 파랑(`#1D4ED8`)으로 변경 |
+| Supabase 전환 후 의원수 0 표시 | PostgreSQL은 unquoted alias를 소문자로 폴드 → `mdeptSdrCnt` → `mdeptsdrCnt` 변환 → `KeyError` | `hospital_api.py` SELECT 별칭 전체를 쌍따옴표로 감쌈(`as "mdeptSdrCnt"`) |
+| Streamlit Cloud에서 `psycopg2.OperationalError` | 클라우드 환경에서 Supabase 접속 시 SSL 필수 | `SUPABASE_DB_URL` 끝에 `?sslmode=require` 추가 |
 
 ---
 
@@ -335,7 +351,7 @@
 |--------------|--------|-------------------|--------|
 | **Step 1** | **정기 Excel 재적재 환경 정비** | `DB_data/` 폴더 내 파일 명명 규칙을 `create_local_db.py`와 일치시키고, 업데이트 절차를 내부 문서화. `update_db_from_api.py`는 참고용으로 보관하되 실운용에서는 사용하지 않음. | 높음 |
 | **Step 2** | **지도 폴리곤 최신화** | 2024~2025년 사이 신설되거나 통폐합된 행정동(예: 상일1동, 개포3동 등)의 최신 공간 데이터(GeoJSON)를 교체하여 지도상에 나타나지 않는 블랭크 지역 완벽 해소. | 중간 |
-| **Step 3** | **온라인 DB (Supabase) 배포** | Streamlit 웹앱을 타인에게 배포하거나 호스팅(Streamlit Cloud 등) 환경으로 전환할 시기 도래 시 적용. `migrate_to_supabase.py`는 이미 완성됨. 단, 웹앱 코드(`population_api.py`, `hospital_api.py`)의 DB 연결부를 SQLite → Supabase 클라이언트로 교체해야 함. 변경 파일 목록은 아래 참조. | 선택 |
+| ~~**Step 3**~~ | ~~**온라인 DB (Supabase) 배포**~~ | ✅ **완료 (24단계)** — psycopg2 직접 연결, `_get_conn()` 추상화, PostgreSQL 호환 버그 수정, 545,059건 이관, Streamlit Cloud 배포 완료. GitHub: `alclssna33/oepn_saturation` | 완료 |
 | **Step 4** | **AI 입지 분석 리포트 도입** | Gemini API 등 LLM을 연동. 사용자가 분석 실행 시 "포화도는 1.5로 여유로우며, 배후 11만 세대 대비 내과 개원이 매우 유리합니다" 와 같은 텍스트 기반 인사이트 요약 패널 추가. | 장기 |
 | ~~**Step 5**~~ | ~~**아파트 실거래가(소득 지표) 통합**~~ | ✅ **완료 (21단계)** — `scripts/import_apt_price.py` + `enrich_with_apt_price()` + `_make_scatter_chart()` 구현. 14개월치(607,586건) 파싱, 3,452개 법정동 평당가 저장, 소득×포화도 산점도 UI 연동. | 완료 |
 
@@ -435,9 +451,13 @@ python scripts/import_apt_price.py
 
 ---
 
-### 11. 온라인 DB 이관 계획 (Supabase)
+### 11. 온라인 DB 이관 계획 (Supabase) ✅ 완료
 
-> **현재 미진행 — 향후 외부 배포(Streamlit Cloud 등) 시점에 실행**
+> **24단계에서 구현 완료 (2026-02-27)**
+> - Supabase 프로젝트: `lezxlbdweqeaionzpqqj` (ap-northeast-2)
+> - Streamlit Cloud 배포 URL: https://github.com/alclssna33/oepn_saturation
+> - 연결 방식: psycopg2 Session Pooler (`aws-1-ap-northeast-2.pooler.supabase.com:5432`) + `?sslmode=require`
+> - 이관 데이터: 545,059건 (6개 테이블)
 
 #### 접근 방식: psycopg2 직접 연결
 Supabase는 PostgreSQL 기반이므로 `psycopg2`로 직접 연결한다.
