@@ -11,6 +11,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, 'data', 'saturation.db')
 
 def _get_conn():
+    from config import SUPABASE_DB_URL
+    if SUPABASE_DB_URL:
+        import psycopg2
+        return psycopg2.connect(SUPABASE_DB_URL)
     if not os.path.exists(DB_PATH):
         raise FileNotFoundError(f"로컬 DB를 찾을 수 없습니다: {DB_PATH}")
     return sqlite3.connect(DB_PATH)

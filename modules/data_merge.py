@@ -20,6 +20,13 @@ _SEOUL_GEOJSON    = Path(__file__).parent.parent / "data" / "geojson" / "seoul_d
 _DEFAULT_GEOJSON  = _NATIONAL_GEOJSON if _NATIONAL_GEOJSON.exists() else _SEOUL_GEOJSON
 _DB_PATH          = Path(__file__).parent.parent / "data" / "saturation.db"
 
+def _get_conn():
+    from config import SUPABASE_DB_URL
+    if SUPABASE_DB_URL:
+        import psycopg2
+        return psycopg2.connect(SUPABASE_DB_URL)
+    return sqlite3.connect(_DB_PATH)
+
 def _get_hira_to_pop_map():
     from modules.hospital_api import HIRA_SGG_MAP
     return {str(v): str(k) for k, v in HIRA_SGG_MAP.items()}
@@ -50,32 +57,26 @@ def enrich_with_apt_price(si_df: pd.DataFrame, analysis_level: str) -> pd.DataFr
       national: si_df.match_key(2자리 sido)     → hjd_cd[:2] 기준 평균
     """
     try:
-        conn = sqlite3.connect(_DB_PATH)
-        # apt_price_bjd 테이블 존재 여부 확인
-        tbl = pd.read_sql_query(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='apt_price_bjd'",
-            conn,
-        )
-        if tbl.empty:
+        conn = _get_conn()
+        # apt_price_bjd 테이블 존재 여부 확인 (SQLite/PostgreSQL 공통 방식)
+        try:
+            price_map = pd.read_sql_query(
+                """
+                SELECT r.hjd_cd,
+                       CAST(
+                           SUM(a.avg_price_per_pyeong * a.trade_count) * 1.0
+                           / SUM(a.trade_count)
+                       AS INTEGER) AS avg_price_per_pyeong
+                FROM region_code_mapping r
+                JOIN apt_price_bjd a ON r.bjd_cd = a.bjd_cd
+                WHERE r.hjd_cd IS NOT NULL AND LENGTH(r.hjd_cd) = 10
+                GROUP BY r.hjd_cd
+                """,
+                conn,
+            )
+        except Exception:
             conn.close()
             return si_df
-
-        # hjd_cd별 거래량 가중 평균 평당가 계산
-        # (hjd_cd 1개가 여러 bjd_cd에 속하므로 거래건수 가중 평균 사용)
-        price_map = pd.read_sql_query(
-            """
-            SELECT r.hjd_cd,
-                   CAST(
-                       SUM(a.avg_price_per_pyeong * a.trade_count) * 1.0
-                       / SUM(a.trade_count)
-                   AS INTEGER) AS avg_price_per_pyeong
-            FROM region_code_mapping r
-            JOIN apt_price_bjd a ON r.bjd_cd = a.bjd_cd
-            WHERE r.hjd_cd IS NOT NULL AND LENGTH(r.hjd_cd) = 10
-            GROUP BY r.hjd_cd
-            """,
-            conn,
-        )
         conn.close()
 
         price_map["hjd_cd"] = price_map["hjd_cd"].astype(str)
@@ -127,7 +128,7 @@ def calc_income_index(si_df: pd.DataFrame, analysis_level: str) -> pd.DataFrame:
     if "avg_price_per_pyeong" not in si_df.columns:
         return si_df
     try:
-        conn = sqlite3.connect(_DB_PATH)
+        conn = _get_conn()
 
         # 1) 전국 hjd_cd별 가중평균 평당가
         price_all = pd.read_sql_query(

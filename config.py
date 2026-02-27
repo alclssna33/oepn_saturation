@@ -10,6 +10,9 @@ load_dotenv()
 PUBLIC_DATA_API_KEY = os.getenv("PUBLIC_DATA_API_KEY", "")
 JUSO_API_KEY = os.getenv("JUSO_API_KEY", "")
 
+# 온라인 DB (Supabase). 설정 시 SQLite 대신 Supabase 사용
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "")
+
 # 관리자 설정
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin1234")
 

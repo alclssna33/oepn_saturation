@@ -20,3 +20,6 @@ shapely>=2.0.0
 
 # 차트
 plotly>=5.20.0
+
+# 온라인 DB (Supabase/PostgreSQL 연결 시 필요)
+psycopg2-binary>=2.9.0

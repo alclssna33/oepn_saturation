@@ -11,9 +11,18 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, 'data', 'saturation.db')
 
 def _get_conn():
+    from config import SUPABASE_DB_URL
+    if SUPABASE_DB_URL:
+        import psycopg2
+        return psycopg2.connect(SUPABASE_DB_URL)
     if not os.path.exists(DB_PATH):
         raise FileNotFoundError(f"로컬 DB를 찾을 수 없습니다: {DB_PATH}")
     return sqlite3.connect(DB_PATH)
+
+def _ph():
+    """플레이스홀더: SQLite=?, PostgreSQL=%s"""
+    from config import SUPABASE_DB_URL
+    return "%s" if SUPABASE_DB_URL else "?"
 
 
 # HIRA 시도 코드 (심평원 실 데이터 기반)
@@ -126,29 +135,30 @@ class HospitalAPIClient:
         if cl_codes is None: 
             cl_codes = ["31", "21", "11"] if include_hospitals else ["31"]
         
-        # SQLite JOIN 쿼리로 한 번에 병원 정보와 진료과목을 가져옵니다.
-        cl_cd_clause = f"h.cl_cd IN ({','.join(['?' for _ in cl_codes])})"
-        
+        # JOIN 쿼리로 한 번에 병원 정보와 진료과목을 가져옵니다.
+        p = _ph()
+        cl_cd_clause = f"h.cl_cd IN ({','.join([p for _ in cl_codes])})"
+
         query = f"""
-        SELECT 
-            h.ykiho, h.hosp_nm as yadmNm, h.addr, h.emdong_nm as emdongNm, 
-            h.sido_cd as sidoCd, '{sido_cd}' as sidoCdNm, 
-            h.sigungu_cd as sgguCd, '{sgg_cd}' as sgguCdNm,
-            h.cl_cd as clCd, h.cl_cd_nm as clCdNm,
+        SELECT
+            h.ykiho, h.hosp_nm as "yadmNm", h.addr, h.emdong_nm as "emdongNm",
+            h.sido_cd as "sidoCd", '{sido_cd}' as "sidoCdNm",
+            h.sigungu_cd as "sgguCd", '{sgg_cd}' as "sgguCdNm",
+            h.cl_cd as "clCd", h.cl_cd_nm as "clCdNm",
             s.dgsbjt_cd as specialty_cd, s.dgsbjt_cd_nm as specialty_nm,
-            s.dr_cnt as mdeptSdrCnt, h.dr_tot_cnt as drTotCnt,
-            h.x_pos as XPos, h.y_pos as YPos, h.estb_dd as estbDd
+            s.dr_cnt as "mdeptSdrCnt", h.dr_tot_cnt as "drTotCnt",
+            h.x_pos as "XPos", h.y_pos as "YPos", h.estb_dd as "estbDd"
         FROM hospital_info h
         INNER JOIN hospital_specialty s ON h.ykiho = s.ykiho
-        WHERE h.sido_cd = ?
+        WHERE h.sido_cd = {p}
           AND {cl_cd_clause}
-          AND s.dgsbjt_cd = ?
+          AND s.dgsbjt_cd = {p}
         """
-        
+
         params = [sido_cd] + cl_codes + [specialty_cd]
-        
+
         if sgg_cd:
-            query += " AND h.sigungu_cd = ?"
+            query += f" AND h.sigungu_cd = {p}"
             params.append(sgg_cd)
             
         with _get_conn() as conn:
@@ -176,33 +186,33 @@ class HospitalAPIClient:
         if specialty_codes is None: 
             specialty_codes = ["01", "05", "11", "12", "14"]
             
-        # SQLite에서는 in 쿼리로 한방에 던질 수 있어 속도가 훨씬 빠릅니다.
-        if cl_codes is None: 
+        if cl_codes is None:
             cl_codes = ["31", "21", "11"]
-            
-        cl_cd_clause = f"h.cl_cd IN ({','.join(['?' for _ in cl_codes])})"
-        spec_clause = f"s.dgsbjt_cd IN ({','.join(['?' for _ in specialty_codes])})"
-        
+
+        p = _ph()
+        cl_cd_clause = f"h.cl_cd IN ({','.join([p for _ in cl_codes])})"
+        spec_clause = f"s.dgsbjt_cd IN ({','.join([p for _ in specialty_codes])})"
+
         query = f"""
-        SELECT 
-            h.ykiho, h.hosp_nm as yadmNm, h.addr, h.emdong_nm as emdongNm, 
-            h.sido_cd as sidoCd, '{sido_cd}' as sidoCdNm, 
-            h.sigungu_cd as sgguCd, '{sgg_cd}' as sgguCdNm,
-            h.cl_cd as clCd, h.cl_cd_nm as clCdNm,
+        SELECT
+            h.ykiho, h.hosp_nm as "yadmNm", h.addr, h.emdong_nm as "emdongNm",
+            h.sido_cd as "sidoCd", '{sido_cd}' as "sidoCdNm",
+            h.sigungu_cd as "sgguCd", '{sgg_cd}' as "sgguCdNm",
+            h.cl_cd as "clCd", h.cl_cd_nm as "clCdNm",
             s.dgsbjt_cd as specialty_cd, s.dgsbjt_cd_nm as specialty_nm,
-            s.dr_cnt as mdeptSdrCnt, h.dr_tot_cnt as drTotCnt,
-            h.x_pos as XPos, h.y_pos as YPos, h.estb_dd as estbDd
+            s.dr_cnt as "mdeptSdrCnt", h.dr_tot_cnt as "drTotCnt",
+            h.x_pos as "XPos", h.y_pos as "YPos", h.estb_dd as "estbDd"
         FROM hospital_info h
         INNER JOIN hospital_specialty s ON h.ykiho = s.ykiho
-        WHERE h.sido_cd = ?
+        WHERE h.sido_cd = {p}
           AND {cl_cd_clause}
           AND {spec_clause}
         """
-        
+
         params = [sido_cd] + cl_codes + specialty_codes
-        
+
         if sgg_cd:
-            query += " AND h.sigungu_cd = ?"
+            query += f" AND h.sigungu_cd = {p}"
             params.append(sgg_cd)
             
         with _get_conn() as conn:
@@ -220,7 +230,7 @@ class HospitalAPIClient:
 
     def get_sgg_list(self, sido_cd: str) -> dict[str, str]:
         # sido_cd (심평원 시도코드) 에 속하는 시군구를 반환
-        query = "SELECT DISTINCT sigungu_cd, addr FROM hospital_info WHERE sido_cd = ?"
+        query = f"SELECT DISTINCT sigungu_cd, addr FROM hospital_info WHERE sido_cd = {_ph()}"
         with _get_conn() as conn:
             df = pd.read_sql_query(query, conn, params=[sido_cd])
             
